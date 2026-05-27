@@ -1,0 +1,5 @@
+# Streamlit Cloud 部署依赖（根目录 requirements.txt）
+pypdf>=4.0.0,<7
+reportlab>=4.0.0,<5
+pymupdf>=1.23.0,<2
+streamlit>=1.30.0,<2

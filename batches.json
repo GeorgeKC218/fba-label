@@ -1,0 +1,23 @@
+{
+  "input": "11_ai.pdf",
+  "batches": [
+    {
+      "name": "GC-259_It12",
+      "start": 1,
+      "count": 90,
+      "output": "GC-259_It12.pdf"
+    },
+    {
+      "name": "GC-230_It30",
+      "start": 91,
+      "count": 17,
+      "output": "GC-230_It30.pdf"
+    },
+    {
+      "name": "GC-258_It50",
+      "start": 108,
+      "count": 71,
+      "output": "GC-258_It50.pdf"
+    }
+  ]
+}

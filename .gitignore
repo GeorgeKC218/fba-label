@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 构建 / 本地输出
+dist/
+build/
+*.spec
+fba_output/
+
+# 本地 PDF（含条码，勿提交到公开仓库）
+*.pdf
+
+# Streamlit 本地缓存
+.streamlit/secrets.toml
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
