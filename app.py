@@ -21,6 +21,7 @@ import streamlit as st
 
 from make_labels import check_pdf_file
 from pdf_outline import outline_pdf
+from pdf_unlock import is_encrypted, unlock_pdf
 from run_batches import run_batches
 
 st.set_page_config(
@@ -316,13 +317,108 @@ def page_outline() -> None:
                 )
 
 
+def page_unlock() -> None:
+    st.header("PDF 解锁")
+    st.caption(
+        "客户发来的加密 PDF：输入打开密码后，导出一份**无密码**的副本，方便本机打开和继续排版。"
+    )
+    st.info(
+        "需要客户提供的正确密码才能解锁。"
+        "本工具不会破解未知密码。"
+        "请上传标准 **%PDF-** 文件。"
+    )
+
+    uploaded = st.file_uploader(
+        "上传加密 PDF",
+        type=["pdf"],
+        key="unlock_upload",
+    )
+    password = st.text_input(
+        "打开密码",
+        type="password",
+        value="",
+        key="unlock_password",
+        help="若客户说没有密码仍打不开，可先留空试一次",
+        placeholder="输入密码（可留空）",
+    )
+
+    enc_hint = None
+    if uploaded is not None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / uploaded.name
+            src.write_bytes(uploaded.getvalue())
+            try:
+                with open(src, "rb") as f:
+                    header = f.read(8)
+                if header.startswith(b"%TSD-"):
+                    st.error("这是 WPS 私有格式 (TSD)，不是标准 PDF。")
+                    return
+                if not header.startswith(b"%PDF-"):
+                    st.error("不是有效 PDF 文件。")
+                    return
+                enc = is_encrypted(src)
+                enc_hint = enc
+                if enc:
+                    st.warning(f"**{uploaded.name}** 已加密，请填写密码后解锁。")
+                else:
+                    st.success(
+                        f"**{uploaded.name}** 看起来未加密。"
+                        "仍可点下方按钮另存一份无限制副本。"
+                    )
+            except Exception as e:
+                st.error(str(e))
+                return
+
+    go = st.button(
+        "解锁并下载",
+        type="primary",
+        disabled=uploaded is None,
+        key="unlock_go",
+    )
+
+    if go and uploaded is not None:
+        with st.spinner("正在解锁…"):
+            with tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                src = work / uploaded.name
+                src.write_bytes(uploaded.getvalue())
+                stem = Path(uploaded.name).stem
+                out = work / f"{stem}_unlocked.pdf"
+                try:
+                    unlock_pdf(src, out, password=password or "")
+                except ValueError as e:
+                    st.error(str(e))
+                    return
+                except Exception as e:
+                    st.error(f"解锁失败: {e}")
+                    return
+
+                data = out.read_bytes()
+                st.success(
+                    f"解锁成功 · 输出约 **{len(data) / 1024:.0f} KB**"
+                    + ("（原文件未加密）" if enc_hint is False else "")
+                )
+                st.download_button(
+                    "下载解锁后的 PDF",
+                    data=data,
+                    file_name=f"{stem}_unlocked.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                    key="unlock_dl",
+                )
+
+
 def main() -> None:
     st.title("FBA 工具站")
-    tab1, tab2 = st.tabs(["📦 条码 A4 排版", "✏️ PDF 转曲"])
+    tab1, tab2, tab3 = st.tabs(
+        ["📦 条码 A4 排版", "✏️ PDF 转曲", "🔓 PDF 解锁"]
+    )
     with tab1:
         page_layout()
     with tab2:
         page_outline()
+    with tab3:
+        page_unlock()
 
     with st.sidebar:
         st.divider()
