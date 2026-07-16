@@ -94,8 +94,19 @@ class LabelApp(tk.Tk):
 
         opt = ttk.Frame(self)
         opt.pack(fill="x", **pad)
+        self.per_page_var = tk.IntVar(value=4)
+        ttk.Label(opt, text="每页:").pack(side="left")
+        ttk.Radiobutton(opt, text="4个(2×2)", variable=self.per_page_var, value=4).pack(
+            side="left"
+        )
+        ttk.Radiobutton(opt, text="6个(2×3)", variable=self.per_page_var, value=6).pack(
+            side="left", padx=4
+        )
+        ttk.Radiobutton(opt, text="2个", variable=self.per_page_var, value=2).pack(
+            side="left", padx=4
+        )
         self.align_var = tk.StringVar(value="center")
-        ttk.Label(opt, text="对齐:").pack(side="left")
+        ttk.Label(opt, text="  对齐:").pack(side="left", padx=(12, 0))
         ttk.Radiobutton(opt, text="居中", variable=self.align_var, value="center").pack(
             side="left"
         )
@@ -226,6 +237,7 @@ class LabelApp(tk.Tk):
                 output_dir=out_dir,
                 align=self.align_var.get(),
                 fill=self.fill_var.get(),
+                per_page=self.per_page_var.get(),
                 quiet=True,
             )
             names = "\n".join(f"  • {p.name}" for p in outputs)

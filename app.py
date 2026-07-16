@@ -1,11 +1,12 @@
 """
-FBA 条码 A4 排版 — 网页版
+FBA 工具站 — 网页版
+
+功能:
+  1. 条码 A4 排版 (按页码拆批, 每页 2/4/6 个)
+  2. PDF 转曲 (文字转曲线, 避免缺字体打不开)
 
 启动:
-    pip install -r requirements.txt
     streamlit run app.py
-
-浏览器会自动打开; 上传 Illustrator 导出的标准 PDF, 填写页码范围, 生成并下载。
 """
 
 from __future__ import annotations
@@ -19,10 +20,11 @@ import fitz
 import streamlit as st
 
 from make_labels import check_pdf_file
+from pdf_outline import outline_pdf
 from run_batches import run_batches
 
 st.set_page_config(
-    page_title="FBA 条码 A4 排版",
+    page_title="FBA 工具站",
     page_icon="📦",
     layout="wide",
 )
@@ -107,39 +109,36 @@ def make_zip(files: list[Path]) -> bytes:
     return buf.getvalue()
 
 
-def main() -> None:
-    st.title("FBA 条码 A4 排版")
+def page_layout() -> None:
+    st.header("条码 A4 排版")
     st.caption(
-        "上传 Illustrator 导出的标准 PDF（每页 1 个标签），"
-        "按页码分成多份 A4 排版文件（每页 6 个，带虚线格）。"
+        "上传每页 1 个标签的 PDF，按页码拆成多份 A4 排版文件（带虚线格）。"
     )
-    with st.expander("使用说明", expanded=False):
-        st.markdown(
-            """
-1. 上传 **%PDF-** 标准文件（Illustrator 导出，不要用 WPS 另存为）
-2. 在下方表格填写每批 **起始页 / 结束页**（从 1 开始）
-3. 点击 **生成 PDF**，下载 ZIP 或单个文件
-4. 默认三批：IT12 (1–90)、IT30 (91–107)、IT50 (108–178)，可按需修改
-            """
-        )
 
     with st.sidebar:
-        st.header("选项")
-        align = st.selectbox("格子内对齐", ["center", "top-left"], index=0)
-        fill = st.checkbox("放大填满格子", value=False, help="默认 1:1 不放大")
-        no_grid = st.checkbox("不绘制虚线", value=False)
-        st.divider()
-        st.markdown(
-            "**注意**\n\n"
-            "- 请上传 **%PDF-** 标准文件\n"
-            "- 不要用 WPS 另存为（会变成 TSD 格式）\n"
-            "- 用 Illustrator：**文件 → 存储为 → Adobe PDF**"
+        st.subheader("排版选项")
+        per_page = st.selectbox(
+            "每页标签数",
+            options=[4, 6, 2],
+            index=0,
+            format_func=lambda n: {
+                4: "4 个 (2列×2行)",
+                6: "6 个 (2列×3行)",
+                2: "2 个 (2列×1行)",
+            }[n],
+            key="layout_per_page",
         )
+        align = st.selectbox(
+            "格子内对齐", ["center", "top-left"], index=0, key="layout_align"
+        )
+        fill = st.checkbox("放大填满格子", value=False, key="layout_fill")
+        no_grid = st.checkbox("不绘制虚线", value=False, key="layout_nogrid")
 
     uploaded = st.file_uploader(
-        "上传源 PDF",
+        "上传源 PDF（条码）",
         type=["pdf"],
-        help="例如 FBA19F1W4F8T-1779858349247.pdf（178 页）",
+        key="layout_upload",
+        help="Illustrator 导出的标准 PDF，不要用 WPS 另存为",
     )
 
     if "batch_table" not in st.session_state:
@@ -148,7 +147,7 @@ def main() -> None:
     st.subheader("批次设置（页码从 1 开始）")
     col_add, col_reset, _ = st.columns([1, 1, 4])
     with col_add:
-        if st.button("＋ 添加一行"):
+        if st.button("＋ 添加一行", key="layout_add"):
             st.session_state.batch_table.append(
                 {
                     "启用": True,
@@ -160,7 +159,7 @@ def main() -> None:
             )
             st.rerun()
     with col_reset:
-        if st.button("恢复默认 (IT12/30/50)"):
+        if st.button("恢复默认 (IT12/30/50)", key="layout_reset"):
             st.session_state.batch_table = DEFAULT_BATCHES.copy()
             st.rerun()
 
@@ -176,6 +175,7 @@ def main() -> None:
             "输出文件名": st.column_config.TextColumn("输出文件名", required=True),
         },
         hide_index=True,
+        key="layout_editor",
     )
     if hasattr(edited, "to_dict"):
         st.session_state.batch_table = edited.to_dict("records")
@@ -195,7 +195,9 @@ def main() -> None:
                 st.error(str(e))
                 return
 
-    generate = st.button("生成 PDF", type="primary", disabled=uploaded is None)
+    generate = st.button(
+        "生成排版 PDF", type="primary", disabled=uploaded is None, key="layout_go"
+    )
 
     if generate and uploaded is not None and total_pages is not None:
         try:
@@ -220,6 +222,7 @@ def main() -> None:
                         align=align,
                         fill=fill,
                         no_grid=no_grid,
+                        per_page=per_page,
                         quiet=True,
                     )
                 except Exception as e:
@@ -227,7 +230,6 @@ def main() -> None:
                     return
 
                 st.success(f"已生成 **{len(outputs)}** 个文件")
-
                 zip_bytes = make_zip(outputs)
                 st.download_button(
                     "下载全部 (ZIP)",
@@ -235,8 +237,8 @@ def main() -> None:
                     file_name="fba_labels.zip",
                     mime="application/zip",
                     type="primary",
+                    key="layout_zip",
                 )
-
                 st.divider()
                 st.subheader("单独下载")
                 cols = st.columns(min(len(outputs), 3))
@@ -248,7 +250,88 @@ def main() -> None:
                             file_name=p.name,
                             mime="application/pdf",
                             use_container_width=True,
+                            key=f"layout_dl_{i}",
                         )
+
+
+def page_outline() -> None:
+    st.header("PDF 转曲")
+    st.caption(
+        "客户发来的稿子没转曲、缺字体打不开时："
+        "上传后自动把**文字转成曲线**，再下载转曲后的 PDF。"
+    )
+    st.info(
+        "说明：相当于 Illustrator「文字 → 创建轮廓」。"
+        "转曲后文字不能再直接改字；页数很多时会稍慢，文件可能变大。"
+        "请上传标准 **%PDF-** 文件（不要用 WPS 另存为的 TSD）。"
+    )
+
+    uploaded = st.file_uploader(
+        "上传客户原稿 PDF",
+        type=["pdf"],
+        key="outline_upload",
+    )
+
+    if uploaded is not None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / uploaded.name
+            src.write_bytes(uploaded.getvalue())
+            try:
+                check_pdf_file(src)
+                n = pdf_page_count(src)
+                st.success(f"已识别：**{n}** 页 · {uploaded.name}")
+            except ValueError as e:
+                st.error(str(e))
+                return
+
+    go = st.button(
+        "开始转曲", type="primary", disabled=uploaded is None, key="outline_go"
+    )
+
+    if go and uploaded is not None:
+        with st.spinner("正在转曲，请稍候…"):
+            with tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                src = work / uploaded.name
+                src.write_bytes(uploaded.getvalue())
+                stem = Path(uploaded.name).stem
+                out = work / f"{stem}_outlined.pdf"
+                try:
+                    outline_pdf(src, out)
+                except Exception as e:
+                    st.error(f"转曲失败: {e}")
+                    return
+
+                data = out.read_bytes()
+                st.success(
+                    f"转曲完成 · 输出约 **{len(data) / 1024:.0f} KB**"
+                )
+                st.download_button(
+                    "下载转曲后的 PDF",
+                    data=data,
+                    file_name=f"{stem}_outlined.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                    key="outline_dl",
+                )
+
+
+def main() -> None:
+    st.title("FBA 工具站")
+    tab1, tab2 = st.tabs(["📦 条码 A4 排版", "✏️ PDF 转曲"])
+    with tab1:
+        page_layout()
+    with tab2:
+        page_outline()
+
+    with st.sidebar:
+        st.divider()
+        st.markdown(
+            "**通用注意**\n\n"
+            "- 上传 **%PDF-** 标准文件\n"
+            "- 不要用 WPS 另存为（会变成 TSD）\n"
+            "- Illustrator：**文件 → 存储为 → Adobe PDF**"
+        )
 
 
 if __name__ == "__main__":

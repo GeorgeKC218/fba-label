@@ -57,6 +57,7 @@ def run_batches(
     align: str = "center",
     fill: bool = False,
     no_grid: bool = False,
+    per_page: int = 4,
     quiet: bool = False,
 ) -> list[Path]:
     """生成批次 PDF, 返回输出文件路径列表。"""
@@ -65,7 +66,7 @@ def run_batches(
     max_scale = None if fill else 1.0
     if not quiet:
         print(f"源文件: {input_pdf.resolve()}")
-        print(f"共 {len(batches)} 个批次\n")
+        print(f"共 {len(batches)} 个批次, 每页 {per_page} 个\n")
 
     outputs: list[Path] = []
     for i, b in enumerate(batches, 1):
@@ -88,6 +89,7 @@ def run_batches(
             out,
             count=count,
             start_page=start,
+            per_page=per_page,
             draw_grid=not no_grid,
             align=align,
             max_scale=max_scale,
@@ -118,6 +120,13 @@ def main() -> None:
     parser.add_argument("--fill", action="store_true", help="放大填满格子")
     parser.add_argument("--no-grid", action="store_true", help="不画虚线")
     parser.add_argument(
+        "--per-page",
+        type=int,
+        choices=(2, 4, 6),
+        default=4,
+        help="每页标签数: 4=2x2 (默认), 6=2x3, 2=2x1",
+    )
+    parser.add_argument(
         "--align",
         choices=("center", "top-left"),
         default="center",
@@ -143,6 +152,7 @@ def main() -> None:
         align=args.align,
         fill=args.fill,
         no_grid=args.no_grid,
+        per_page=args.per_page,
     )
 
 

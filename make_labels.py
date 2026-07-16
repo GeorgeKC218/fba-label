@@ -2,15 +2,15 @@
 条码标签 A4 排版 (与 Illustrator 导出的 12_ai.pdf 网格一致)
 
 输入:
-  - 多页: 11_ai.pdf (每页 1 个标签, 如 178 页) -> 按顺序排进 A4 每页 6 个
+  - 多页: 11_ai.pdf (每页 1 个标签, 如 178 页) -> 按顺序排进 A4
   - 单页: 复制同一标签 N 次
 
-输出: A4 (210x297mm), 2 列 x 3 行, 虚线网格与 12_ai.pdf 一致
+输出: A4, 默认每页 4 个 (2 列 x 2 行), 也可 6 个 (2x3) / 2 个 (2x1)
 
 用法:
     python make_labels.py 11_ai.pdf
-    python make_labels.py 11_ai.pdf 90 -o GC-259_lt12.pdf
-    python make_labels.py 11_ai.pdf 178 -o output.pdf
+    python make_labels.py 11_ai.pdf 90 -o GC-259_It12.pdf --per-page 4
+    python make_labels.py 11_ai.pdf 178 --per-page 6 -o output_6up.pdf
 """
 
 from __future__ import annotations
@@ -288,24 +288,30 @@ def check_pdf_file(path: Path) -> None:
     )
 
 
-COLS = 2
-ROWS = 3
-PER_PAGE = COLS * ROWS
+# 从 12_ai.pdf 提取的外框边距; 格子按行列均分
+_MARGIN_LEFT = 0.0
+_MARGIN_BOTTOM = 61.6123
+_CELL_W = 297.6377  # 半页宽 (2 列)
+_GRID_HEIGHT = 720.0  # 6-up 时 3 行 x 240pt
 
 
-# 从 12_ai.pdf (Illustrator 导出) 提取的网格参数
 @dataclass(frozen=True)
 class GridSpec:
-    """与参考 PDF 12_ai.pdf 一致的 A4 虚线网格。"""
+    """A4 虚线网格 (2 列 x N 行)。"""
 
-    margin_left: float = 0.0
-    margin_bottom: float = 61.6123
-    margin_top: float = 60.2235  # 841.89 - 781.6665
-    cell_w: float = 297.6377
-    cell_h: float = 240.0
+    cols: int = 2
+    rows: int = 2
+    margin_left: float = _MARGIN_LEFT
+    margin_bottom: float = _MARGIN_BOTTOM
+    cell_w: float = _CELL_W
+    cell_h: float = _GRID_HEIGHT / 2  # 默认 4-up (2x2)
     dash_on: float = 11.761
     dash_off: float = 11.915
     line_width: float = 0.5
+
+    @property
+    def per_page(self) -> int:
+        return self.cols * self.rows
 
     @property
     def grid_left(self) -> float:
@@ -317,25 +323,36 @@ class GridSpec:
 
     @property
     def grid_width(self) -> float:
-        return self.cell_w * COLS
+        return self.cell_w * self.cols
 
     @property
     def grid_height(self) -> float:
-        return self.cell_h * ROWS
+        return self.cell_h * self.rows
 
     @property
     def grid_top(self) -> float:
         return self.grid_bottom + self.grid_height
 
     def cell_top_y(self, row_from_top: int) -> float:
-        """row_from_top: 0=最上行, 2=最下行 (PDF 坐标, 格子上沿)。"""
-        return self.grid_bottom + (ROWS - row_from_top) * self.cell_h
+        """row_from_top: 0=最上行 (PDF 坐标, 格子上沿)。"""
+        return self.grid_bottom + (self.rows - row_from_top) * self.cell_h
 
     def cell_left_x(self, col: int) -> float:
         return self.grid_left + col * self.cell_w
 
 
-GRID = GridSpec()
+def get_grid_spec(per_page: int = 4) -> GridSpec:
+    """per_page: 4 = 2列x2行, 6 = 2列x3行 (原 12_ai 样式)。"""
+    if per_page == 4:
+        return GridSpec(cols=2, rows=2, cell_h=_GRID_HEIGHT / 2)
+    if per_page == 6:
+        return GridSpec(cols=2, rows=3, cell_h=_GRID_HEIGHT / 3)
+    if per_page == 2:
+        return GridSpec(cols=2, rows=1, cell_h=_GRID_HEIGHT)
+    raise ValueError(f"不支持每页 {per_page} 个, 请选 2 / 4 / 6")
+
+
+GRID = get_grid_spec(4)
 
 
 def make_dashed_grid_page_bytes(spec: GridSpec = GRID) -> bytes:
@@ -348,10 +365,11 @@ def make_dashed_grid_page_bytes(spec: GridSpec = GRID) -> bytes:
     g = spec
     c.rect(g.grid_left, g.grid_bottom, g.grid_width, g.grid_height, stroke=1, fill=0)
 
-    x_mid = g.grid_left + g.cell_w
-    c.line(x_mid, g.grid_bottom, x_mid, g.grid_top)
+    for i in range(1, g.cols):
+        x = g.grid_left + i * g.cell_w
+        c.line(x, g.grid_bottom, x, g.grid_top)
 
-    for i in range(1, ROWS):
+    for i in range(1, g.rows):
         y = g.grid_bottom + i * g.cell_h
         c.line(g.grid_left, y, g.grid_left + g.grid_width, y)
 
@@ -421,7 +439,8 @@ def make_grid_pdf(
     out_pdf: Path,
     count: int | None = None,
     start_page: int = 1,
-    spec: GridSpec = GRID,
+    spec: GridSpec | None = None,
+    per_page: int = 4,
     draw_grid: bool = True,
     align: str = "center",
     rotate: int | None = None,
@@ -431,12 +450,17 @@ def make_grid_pdf(
     cell_padding: float = 0.0,
 ) -> None:
     """
+    per_page: 每页标签数, 4=2x2 (默认), 6=2x3, 2=2x1
     fit:
       - "content"  按内容实际边界 (PyMuPDF), 默认 1:1 不放大
       - "media"    按 MediaBox 整张缩放
-
     max_scale: None=可任意放大填满; 1.0=1:1 原尺寸 (默认).
     """
+    if spec is None:
+        spec = get_grid_spec(per_page)
+    cols = spec.cols
+    per = spec.per_page
+
     check_pdf_file(src_pdf)
     reader = PdfReader(str(src_pdf))
     if reader.is_encrypted:
@@ -482,7 +506,7 @@ def make_grid_pdf(
         template_page = PdfReader(io.BytesIO(template_bytes)).pages[0]
 
     writer = PdfWriter()
-    pages_needed = (count + PER_PAGE - 1) // PER_PAGE
+    pages_needed = (count + per - 1) // per
 
     for out_idx in range(pages_needed):
         a4_page = PageObject.create_blank_page(
@@ -491,13 +515,13 @@ def make_grid_pdf(
         if template_page is not None:
             a4_page.merge_page(template_page)
 
-        for slot in range(PER_PAGE):
-            label_idx = out_idx * PER_PAGE + slot
+        for slot in range(per):
+            label_idx = out_idx * per + slot
             if label_idx >= count:
                 break
 
-            row_from_top = slot // COLS
-            col = slot % COLS
+            row_from_top = slot // cols
+            col = slot % cols
 
             if total_src == 1:
                 src_page = reader.pages[0]
@@ -560,7 +584,8 @@ def make_grid_pdf(
 
     print(
         f"已生成: {out_pdf}\n"
-        f"  标签数: {count}, 输出页数: {pages_needed} (每页 {PER_PAGE} 个)\n"
+        f"  标签数: {count}, 输出页数: {pages_needed}"
+        f" (每页 {per} 个 = {spec.cols}列x{spec.rows}行)\n"
         f"  源: {src_pdf.name} ({total_src} 页)\n"
         f"  MediaBox: {media_w:.2f} x {media_h:.2f} pt\n"
         f"  内容 bbox (PyMuPDF): ({bbox[0]:.2f}, {bbox[1]:.2f}) - "
@@ -573,7 +598,7 @@ def make_grid_pdf(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="标签 PDF -> A4 每页 6 个 (网格与 12_ai.pdf 一致)",
+        description="标签 PDF -> A4 排版 (默认每页 4 个 = 2列x2行)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -593,6 +618,13 @@ def main() -> None:
         help="从源 PDF 第几页开始 (1-based, 默认 1)",
     )
     parser.add_argument(
+        "--per-page",
+        type=int,
+        choices=(2, 4, 6),
+        default=4,
+        help="每页标签数: 4=2x2 (默认), 6=2x3, 2=2x1",
+    )
+    parser.add_argument(
         "--align",
         choices=("top-left", "center"),
         default="center",
@@ -603,7 +635,7 @@ def main() -> None:
         type=int,
         choices=(0, 90, 180, 270),
         default=None,
-        help="标签旋转角度 (默认自动: 内容和格子方向不一致时旋转 90)",
+        help="标签旋转角度 (默认 0)",
     )
     parser.add_argument(
         "--fit",
@@ -639,7 +671,7 @@ def main() -> None:
         parser.error("请指定 count, 或使用多页源 PDF")
 
     output = args.output or args.input.with_name(
-        f"{args.input.stem}_A4-6up_x{count}.pdf"
+        f"{args.input.stem}_A4-{args.per_page}up_x{count}.pdf"
     )
 
     src_bbox_override = None
@@ -658,6 +690,7 @@ def main() -> None:
         output,
         count=count,
         start_page=args.start,
+        per_page=args.per_page,
         draw_grid=not args.no_grid,
         align=args.align,
         rotate=args.rotate,
