@@ -58,6 +58,9 @@ def run_batches(
     fill: bool = False,
     no_grid: bool = False,
     per_page: int = 4,
+    trim_border: bool = False,
+    compact: bool = False,
+    gutter: float | None = None,
     quiet: bool = False,
 ) -> list[Path]:
     """生成批次 PDF, 返回输出文件路径列表。"""
@@ -93,6 +96,9 @@ def run_batches(
             draw_grid=not no_grid,
             align=align,
             max_scale=max_scale,
+            trim_border=trim_border,
+            compact=compact,
+            gutter=gutter,
         )
         outputs.append(out)
         if not quiet:
@@ -122,16 +128,37 @@ def main() -> None:
     parser.add_argument(
         "--per-page",
         type=int,
-        choices=(2, 4, 6),
+        choices=(2, 4, 6, 9),
         default=4,
-        help="每页标签数: 4=2x2 (默认), 6=2x3, 2=2x1",
+        help="每页标签数: 4=2x2 (默认), 6=2x3, 9=3x3, 2=2x1",
     )
     parser.add_argument(
         "--align",
         choices=("center", "top-left"),
         default="center",
     )
+    parser.add_argument(
+        "--trim-border",
+        action="store_true",
+        help="裁掉源标签外黑框, 再按比例放进虚线格",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="自适应虚线格+保留黑框+两两贴中间",
+    )
+    parser.add_argument(
+        "--gutter",
+        type=float,
+        nargs="?",
+        const=6.0,
+        default=None,
+        help="留缝版空隙宽度 (pt), 默认 6; 与 --compact 互斥",
+    )
     args = parser.parse_args()
+
+    if args.compact and args.gutter is not None:
+        parser.error("--compact 与 --gutter 不能同时使用")
 
     if args.batch:
         if not args.input:
@@ -153,6 +180,9 @@ def main() -> None:
         fill=args.fill,
         no_grid=args.no_grid,
         per_page=args.per_page,
+        trim_border=args.trim_border,
+        compact=args.compact,
+        gutter=args.gutter,
     )
 
 

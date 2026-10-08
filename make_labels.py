@@ -264,6 +264,80 @@ def get_content_bbox(
         raise
 
 
+def detect_label_frame(page) -> tuple[fitz.Rect, float]:
+    """检测标签外黑框矩形与描边宽度 (PyMuPDF 坐标)。"""
+    media = page.rect
+    media_area = abs(media)
+    frame = None
+    stroke_w = 0.5
+    for d in page.get_drawings():
+        r = fitz.Rect(d["rect"])
+        if r.is_empty:
+            continue
+        is_stroke = d.get("color") is not None and d.get("fill") is None
+        if not is_stroke:
+            continue
+        area = abs(r)
+        if 0.35 * media_area < area < 0.98 * media_area:
+            if frame is None or area > abs(frame):
+                frame = r
+                sw = d.get("width")
+                if sw is not None and float(sw) > 0:
+                    stroke_w = float(sw)
+    return (frame if frame is not None else media), stroke_w
+
+
+def detect_label_frame_rect(page):
+    """检测标签外黑框矩形 (PyMuPDF 坐标)。"""
+    return detect_label_frame(page)[0]
+
+
+def detect_label_clip_rect(page, inset: float = 3.0):
+    """检测标签外黑框并裁剪.
+
+    inset>0: 去掉黑框 (向内缩)
+    inset==0: 裁到描边中线
+    inset<0: 保留黑框; 若 inset 为 -1, 自动外扩半个描边宽度使墨边贴齐裁切边
+    """
+    media = page.rect
+    frame, stroke_w = detect_label_frame(page)
+    if inset == -1:
+        # 墨迹外沿贴齐页面边, 避免裁切页四周留白导致双线白缝
+        inset = -0.5 * stroke_w
+    clip = fitz.Rect(
+        frame.x0 + inset,
+        frame.y0 + inset,
+        frame.x1 - inset,
+        frame.y1 - inset,
+    )
+    return clip & media
+
+
+def make_trimmed_label_pdf(
+    src_pdf: Path,
+    start_page: int,
+    count: int,
+    inset: float = 3.0,
+) -> bytes:
+    """按外框裁剪每页标签, 返回多页 PDF 字节。inset<=0 时保留黑框。"""
+    src_doc = fitz.open(str(src_pdf))
+    out_doc = fitz.open()
+    try:
+        for i in range(start_page - 1, start_page - 1 + count):
+            page = src_doc[i]
+            clip = detect_label_clip_rect(page, inset=inset)
+            if clip.is_empty or clip.width < 10 or clip.height < 10:
+                clip = page.rect
+            npage = out_doc.new_page(width=clip.width, height=clip.height)
+            npage.show_pdf_page(npage.rect, src_doc, i, clip=clip)
+        buf = io.BytesIO()
+        out_doc.save(buf, deflate=True, garbage=3)
+        return buf.getvalue()
+    finally:
+        src_doc.close()
+        out_doc.close()
+
+
 A4_WIDTH_PT, A4_HEIGHT_PT = RL_A4
 MM_TO_PT = 72.0 / 25.4
 
@@ -308,6 +382,12 @@ class GridSpec:
     dash_on: float = 11.761
     dash_off: float = 11.915
     line_width: float = 0.5
+    # 黑框重叠布局: 最右/最下多出的重叠宽度 (pt)
+    edge_extend_x: float = 0.0
+    edge_extend_y: float = 0.0
+    # 留缝布局: cell = 标签尺寸 + gutter; 块宽需减去末列/末行多余 gutter
+    gutter_x: float = 0.0
+    gutter_y: float = 0.0
 
     @property
     def per_page(self) -> int:
@@ -323,39 +403,166 @@ class GridSpec:
 
     @property
     def grid_width(self) -> float:
-        return self.cell_w * self.cols
+        return self.cell_w * self.cols + self.edge_extend_x - self.gutter_x
 
     @property
     def grid_height(self) -> float:
-        return self.cell_h * self.rows
+        return self.cell_h * self.rows + self.edge_extend_y - self.gutter_y
 
     @property
     def grid_top(self) -> float:
         return self.grid_bottom + self.grid_height
 
     def cell_top_y(self, row_from_top: int) -> float:
-        """row_from_top: 0=最上行 (PDF 坐标, 格子上沿)。"""
-        return self.grid_bottom + (self.rows - row_from_top) * self.cell_h
+        """row_from_top: 0=最上行 (PDF 坐标, 该行标签上沿)。"""
+        return (
+            self.grid_bottom
+            + self.edge_extend_y
+            + (self.rows - row_from_top) * self.cell_h
+            - self.gutter_y
+        )
 
     def cell_left_x(self, col: int) -> float:
         return self.grid_left + col * self.cell_w
 
 
 def get_grid_spec(per_page: int = 4) -> GridSpec:
-    """per_page: 4 = 2列x2行, 6 = 2列x3行 (原 12_ai 样式)。"""
+    """per_page: 4=2x2, 6=2x3, 9=3x3, 2=2x1。"""
     if per_page == 4:
         return GridSpec(cols=2, rows=2, cell_h=_GRID_HEIGHT / 2)
     if per_page == 6:
         return GridSpec(cols=2, rows=3, cell_h=_GRID_HEIGHT / 3)
+    if per_page == 9:
+        # 固定半页风格不适用 3 列, 用均分可用高度
+        cell_w = A4_WIDTH_PT / 3
+        cell_h = _GRID_HEIGHT / 3
+        return GridSpec(
+            cols=3,
+            rows=3,
+            margin_left=0.0,
+            margin_bottom=_MARGIN_BOTTOM,
+            cell_w=cell_w,
+            cell_h=cell_h,
+        )
     if per_page == 2:
         return GridSpec(cols=2, rows=1, cell_h=_GRID_HEIGHT)
-    raise ValueError(f"不支持每页 {per_page} 个, 请选 2 / 4 / 6")
+    raise ValueError(f"不支持每页 {per_page} 个, 请选 2 / 4 / 6 / 9")
 
 
 GRID = get_grid_spec(4)
 
 
-def make_dashed_grid_page_bytes(spec: GridSpec = GRID) -> bytes:
+def build_compact_grid(
+    label_w: float,
+    label_h: float,
+    cols: int,
+    rows: int,
+    page_margin: float = 16.0,
+    border_overlap_src: float = 1.0,
+) -> tuple[GridSpec, float, float, float]:
+    """按标签比例自适应布局, 相邻标签黑框描边重合为一条裁切线。
+
+    border_overlap_src: 源坐标下相邻标签重叠量 (pt)。
+      墨边已贴齐裁切边时, 取约 1 个描边宽即可; 过大反而会双线夹白缝。
+    返回 (spec, scale, scaled_w, scaled_h)。
+    spec.cell_w/h = 步进间距 (pitch); edge_extend = 重叠量 (缩放后)。
+    """
+    avail_w = A4_WIDTH_PT - 2 * page_margin
+    avail_h = A4_HEIGHT_PT - 2 * page_margin
+    if label_w <= 0 or label_h <= 0:
+        raise ValueError("标签尺寸无效")
+
+    ov_src = min(border_overlap_src, label_w * 0.08, label_h * 0.08)
+    denom_w = cols * label_w - (cols - 1) * ov_src
+    denom_h = rows * label_h - (rows - 1) * ov_src
+    scale = min(avail_w / denom_w, avail_h / denom_h)
+    if scale <= 0:
+        raise ValueError("页边距过大, 放不下标签")
+
+    scaled_w = label_w * scale
+    scaled_h = label_h * scale
+    ov = ov_src * scale
+    pitch_w = scaled_w - ov
+    pitch_h = scaled_h - ov
+    block_w = cols * scaled_w - (cols - 1) * ov
+    block_h = rows * scaled_h - (rows - 1) * ov
+    margin_left = (A4_WIDTH_PT - block_w) / 2.0
+    margin_bottom = (A4_HEIGHT_PT - block_h) / 2.0
+
+    spec = GridSpec(
+        cols=cols,
+        rows=rows,
+        margin_left=margin_left,
+        margin_bottom=margin_bottom,
+        cell_w=pitch_w,
+        cell_h=pitch_h,
+        edge_extend_x=ov,
+        edge_extend_y=ov,
+    )
+    return spec, scale, scaled_w, scaled_h
+
+
+def build_spaced_grid(
+    label_w: float,
+    label_h: float,
+    cols: int,
+    rows: int,
+    page_margin: float = 16.0,
+    gutter_pt: float = 6.0,
+) -> tuple[GridSpec, float, float, float]:
+    """按标签比例自适应布局, 相邻标签之间留白缝, 缝中画裁切线。"""
+    avail_w = A4_WIDTH_PT - 2 * page_margin
+    avail_h = A4_HEIGHT_PT - 2 * page_margin
+    if label_w <= 0 or label_h <= 0:
+        raise ValueError("标签尺寸无效")
+    gutter = max(float(gutter_pt), 0.0)
+
+    scale = min(
+        (avail_w - (cols - 1) * gutter) / (cols * label_w),
+        (avail_h - (rows - 1) * gutter) / (rows * label_h),
+    )
+    if scale <= 0:
+        raise ValueError("页边距或空隙过大, 放不下标签")
+
+    scaled_w = label_w * scale
+    scaled_h = label_h * scale
+    pitch_w = scaled_w + gutter
+    pitch_h = scaled_h + gutter
+    block_w = cols * scaled_w + (cols - 1) * gutter
+    block_h = rows * scaled_h + (rows - 1) * gutter
+    margin_left = (A4_WIDTH_PT - block_w) / 2.0
+    margin_bottom = (A4_HEIGHT_PT - block_h) / 2.0
+
+    spec = GridSpec(
+        cols=cols,
+        rows=rows,
+        margin_left=margin_left,
+        margin_bottom=margin_bottom,
+        cell_w=pitch_w,
+        cell_h=pitch_h,
+        gutter_x=gutter,
+        gutter_y=gutter,
+    )
+    return spec, scale, scaled_w, scaled_h
+
+
+def make_dashed_grid_page_bytes(
+    spec: GridSpec = GRID,
+    *,
+    draw_internal: bool = True,
+    extend_outer_to_edges: bool = False,
+    cut_guides_in_margins: bool = False,
+    cut_guides_in_gutters: bool = False,
+) -> bytes:
+    """画虚线网格.
+
+    cut_guides_in_margins=True (贴边裁切):
+      - 每个裁切位虚线只画在标签外侧白边, 延伸到纸边
+      - 标签区域内不画虚线, 内部靠黑框重合裁切
+    cut_guides_in_gutters=True (留缝裁切):
+      - 外框边 + 空隙中线画裁切虚线, 延伸到纸边
+    draw_internal / extend_outer_to_edges: 旧模式兼容
+    """
     buf = io.BytesIO()
     c = rl_canvas.Canvas(buf, pagesize=RL_A4)
     c.setStrokeColorRGB(0, 0, 0)
@@ -363,15 +570,71 @@ def make_dashed_grid_page_bytes(spec: GridSpec = GRID) -> bytes:
     c.setDash(spec.dash_on, spec.dash_off)
 
     g = spec
-    c.rect(g.grid_left, g.grid_bottom, g.grid_width, g.grid_height, stroke=1, fill=0)
+    left = g.grid_left
+    right = g.grid_left + g.grid_width
+    bottom = g.grid_bottom
+    top = g.grid_top
 
-    for i in range(1, g.cols):
-        x = g.grid_left + i * g.cell_w
-        c.line(x, g.grid_bottom, x, g.grid_top)
+    if cut_guides_in_gutters and (g.gutter_x > 0 or g.gutter_y > 0):
+        label_w = g.cell_w - g.gutter_x
+        label_h = g.cell_h - g.gutter_y
+        # 外框: 只在页边留裁切短线, 不压到标签黑框
+        for y in (bottom, top):
+            if left > 0.5:
+                c.line(0, y, left, y)
+            if right < A4_WIDTH_PT - 0.5:
+                c.line(right, y, A4_WIDTH_PT, y)
+        for x in (left, right):
+            if bottom > 0.5:
+                c.line(x, 0, x, bottom)
+            if top < A4_HEIGHT_PT - 0.5:
+                c.line(x, top, x, A4_HEIGHT_PT)
+        # 空隙中线: 整条贯通 (只经过白缝与页边)
+        for i in range(g.cols - 1):
+            x = left + (i + 1) * label_w + (i + 0.5) * g.gutter_x
+            c.line(x, 0, x, A4_HEIGHT_PT)
+        for i in range(g.rows - 1):
+            y = bottom + (i + 1) * label_h + (i + 0.5) * g.gutter_y
+            c.line(0, y, A4_WIDTH_PT, y)
+    elif cut_guides_in_margins:
+        # 水平裁切线: 底边 + 各步进 + 顶边(含重叠延伸)
+        y_cuts = [bottom + i * g.cell_h for i in range(g.rows)]
+        y_cuts.append(top)
+        for y in y_cuts:
+            if left > 0.5:
+                c.line(0, y, left, y)
+            if right < A4_WIDTH_PT - 0.5:
+                c.line(right, y, A4_WIDTH_PT, y)
 
-    for i in range(1, g.rows):
-        y = g.grid_bottom + i * g.cell_h
-        c.line(g.grid_left, y, g.grid_left + g.grid_width, y)
+        # 垂直裁切线: 左边 + 各步进 + 右边(含重叠延伸)
+        x_cuts = [left + i * g.cell_w for i in range(g.cols)]
+        x_cuts.append(right)
+        for x in x_cuts:
+            if bottom > 0.5:
+                c.line(x, 0, x, bottom)
+            if top < A4_HEIGHT_PT - 0.5:
+                c.line(x, top, x, A4_HEIGHT_PT)
+    elif extend_outer_to_edges:
+        c.line(0, top, A4_WIDTH_PT, top)
+        c.line(0, bottom, A4_WIDTH_PT, bottom)
+        c.line(left, 0, left, A4_HEIGHT_PT)
+        c.line(right, 0, right, A4_HEIGHT_PT)
+        if draw_internal:
+            for i in range(1, g.cols):
+                x = left + i * g.cell_w
+                c.line(x, bottom, x, top)
+            for i in range(1, g.rows):
+                y = bottom + i * g.cell_h
+                c.line(left, y, right, y)
+    else:
+        c.rect(left, bottom, g.grid_width, g.grid_height, stroke=1, fill=0)
+        if draw_internal:
+            for i in range(1, g.cols):
+                x = left + i * g.cell_w
+                c.line(x, bottom, x, top)
+            for i in range(1, g.rows):
+                y = bottom + i * g.cell_h
+                c.line(left, y, right, y)
 
     c.showPage()
     c.save()
@@ -448,31 +711,68 @@ def make_grid_pdf(
     src_bbox_override: tuple[float, float, float, float] | None = None,
     max_scale: float | None = 1.0,
     cell_padding: float = 0.0,
+    trim_border: bool = False,
+    border_inset: float = 3.0,
+    compact: bool = False,
+    gutter: float | None = None,
 ) -> None:
     """
-    per_page: 每页标签数, 4=2x2 (默认), 6=2x3, 2=2x1
-    fit:
-      - "content"  按内容实际边界 (PyMuPDF), 默认 1:1 不放大
-      - "media"    按 MediaBox 整张缩放
-    max_scale: None=可任意放大填满; 1.0=1:1 原尺寸 (默认).
+    per_page: 每页标签数, 4=2x2, 6=2x3, 9=3x3, 2=2x1
+    compact: 按标签比例自适应, 保留黑框, 相邻描边重合
+    gutter: 相邻标签留白缝宽度 (pt); 与 compact 互斥, 缝中画裁切线
+    trim_border: 裁掉源标签外黑框后再排进虚线格
     """
-    if spec is None:
-        spec = get_grid_spec(per_page)
-    cols = spec.cols
-    per = spec.per_page
-
     check_pdf_file(src_pdf)
-    reader = PdfReader(str(src_pdf))
+    src_name = src_pdf.name
+
+    if count is None:
+        peek = PdfReader(str(src_pdf))
+        count = len(peek.pages) - (start_page - 1)
+    if count <= 0:
+        raise ValueError("count 必须大于 0")
+
+    if compact and gutter is not None:
+        raise ValueError("compact 与 gutter 不能同时使用")
+
+    spaced = gutter is not None
+    # compact / spaced: 保留黑框, 墨边贴齐裁切边, 再自适应格子
+    compact_stroke_w = 0.5
+    if compact or spaced:
+        trim_border = True
+        border_inset = -1.0  # 哨兵: detect_label_clip_rect 按描边半宽外扩
+        fit = "media"
+        align = "center"
+        max_scale = None
+        cell_padding = 0.0
+        try:
+            with fitz.open(str(src_pdf)) as _src:
+                _idx = min(max(start_page - 1, 0), _src.page_count - 1)
+                _, compact_stroke_w = detect_label_frame(_src[_idx])
+        except Exception:
+            pass
+
+    if trim_border:
+        trimmed_bytes = make_trimmed_label_pdf(
+            src_pdf, start_page, count, inset=border_inset
+        )
+        reader = PdfReader(io.BytesIO(trimmed_bytes))
+        start_page = 1
+        fit = "media"
+        if not compact and not spaced and cell_padding <= 0:
+            cell_padding = 4.0
+        if not compact and not spaced and max_scale == 1.0:
+            max_scale = None
+    else:
+        reader = PdfReader(str(src_pdf))
+
     if reader.is_encrypted:
         reader.decrypt("")
     total_src = len(reader.pages)
     if total_src == 0:
-        raise ValueError(f"源 PDF 没有任何页面: {src_pdf}")
+        raise ValueError(f"源 PDF 没有任何页面: {src_name}")
 
-    if count is None:
-        count = total_src - (start_page - 1)
-    if count <= 0:
-        raise ValueError("count 必须大于 0")
+    if rotate is None:
+        rotate = 0
 
     sample_idx = 0 if total_src == 1 else (start_page - 1)
     sample_page = reader.pages[sample_idx]
@@ -483,9 +783,16 @@ def make_grid_pdf(
     if src_bbox_override is not None:
         bbox = src_bbox_override
     elif fit == "content":
-        bbox = get_content_bbox(
-            src_pdf, sample_idx, sample_page, reader
-        )
+        # 裁剪后的临时页用 media; 未裁剪才走路径探测
+        if trim_border:
+            bbox = (
+                float(media.left),
+                float(media.bottom),
+                float(media.right),
+                float(media.top),
+            )
+        else:
+            bbox = get_content_bbox(src_pdf, sample_idx, sample_page, reader)
     else:
         bbox = (
             float(media.left),
@@ -497,12 +804,39 @@ def make_grid_pdf(
     bw = bbox[2] - bbox[0]
     bh = bbox[3] - bbox[1]
 
-    if rotate is None:
-        rotate = 0
+    compact_scale = None
+    compact_sw = compact_sh = None
+    if compact or spaced:
+        cols = {2: 2, 4: 2, 6: 2, 9: 3}[per_page]
+        rows = {2: 1, 4: 2, 6: 3, 9: 3}[per_page]
+        if spaced:
+            spec, compact_scale, compact_sw, compact_sh = build_spaced_grid(
+                bw, bh, cols=cols, rows=rows, gutter_pt=float(gutter or 6.0)
+            )
+        else:
+            # 墨边贴齐后, 重叠 1 个描边宽 → 相邻黑框重合为一条裁切线
+            spec, compact_scale, compact_sw, compact_sh = build_compact_grid(
+                bw,
+                bh,
+                cols=cols,
+                rows=rows,
+                border_overlap_src=max(compact_stroke_w, 0.5),
+            )
+    elif spec is None:
+        spec = get_grid_spec(per_page)
+
+    cols = spec.cols
+    per = spec.per_page
 
     template_page = None
     if draw_grid:
-        template_bytes = make_dashed_grid_page_bytes(spec)
+        template_bytes = make_dashed_grid_page_bytes(
+            spec,
+            draw_internal=not (compact or spaced),
+            extend_outer_to_edges=False,
+            cut_guides_in_margins=compact,
+            cut_guides_in_gutters=spaced,
+        )
         template_page = PdfReader(io.BytesIO(template_bytes)).pages[0]
 
     writer = PdfWriter()
@@ -536,7 +870,7 @@ def make_grid_pdf(
                 src_page = reader.pages[src_page_idx]
                 if src_bbox_override is not None:
                     page_bbox = src_bbox_override
-                elif fit == "content":
+                elif fit == "content" and not trim_border:
                     page_bbox = get_content_bbox(
                         src_pdf, src_page_idx, src_page, reader
                     )
@@ -549,16 +883,28 @@ def make_grid_pdf(
                         float(m.top),
                     )
 
-            transform = _label_transform(
-                spec,
-                page_bbox,
-                row_from_top,
-                col,
-                align=align,
-                rotate=rotate,
-                max_scale=max_scale,
-                cell_padding=cell_padding,
-            )
+            if (compact or spaced) and compact_scale is not None:
+                # 固定缩放, 按 pitch 步进放置
+                x0, y0, x1, y1 = page_bbox
+                tx = spec.cell_left_x(col)
+                ty = spec.cell_top_y(row_from_top) - compact_sh
+                transform = (
+                    Transformation()
+                    .translate(-x0, -y0)
+                    .scale(compact_scale, compact_scale)
+                    .translate(tx, ty)
+                )
+            else:
+                transform = _label_transform(
+                    spec,
+                    page_bbox,
+                    row_from_top,
+                    col,
+                    align=align,
+                    rotate=rotate,
+                    max_scale=max_scale,
+                    cell_padding=cell_padding,
+                )
             a4_page.merge_transformed_page(src_page, transform)
 
         writer.add_page(a4_page)
@@ -586,7 +932,7 @@ def make_grid_pdf(
         f"已生成: {out_pdf}\n"
         f"  标签数: {count}, 输出页数: {pages_needed}"
         f" (每页 {per} 个 = {spec.cols}列x{spec.rows}行)\n"
-        f"  源: {src_pdf.name} ({total_src} 页)\n"
+        f"  源: {src_name} ({total_src} 页)\n"
         f"  MediaBox: {media_w:.2f} x {media_h:.2f} pt\n"
         f"  内容 bbox (PyMuPDF): ({bbox[0]:.2f}, {bbox[1]:.2f}) - "
         f"({bbox[2]:.2f}, {bbox[3]:.2f})  = {bw:.2f} x {bh:.2f} pt\n"
@@ -620,9 +966,9 @@ def main() -> None:
     parser.add_argument(
         "--per-page",
         type=int,
-        choices=(2, 4, 6),
+        choices=(2, 4, 6, 9),
         default=4,
-        help="每页标签数: 4=2x2 (默认), 6=2x3, 2=2x1",
+        help="每页标签数: 4=2x2 (默认), 6=2x3, 9=3x3, 2=2x1",
     )
     parser.add_argument(
         "--align",
@@ -661,7 +1007,28 @@ def main() -> None:
         help="手动指定源 PDF 取景框 'x0,y0,x1,y1' (pt), 会覆盖 fit 自动检测",
     )
     parser.add_argument("--no-grid", action="store_true", help="不绘制虚线")
+    parser.add_argument(
+        "--trim-border",
+        action="store_true",
+        help="裁掉源标签外黑框, 再按比例完整放进虚线格",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="自适应虚线格+保留黑框+两两贴中间(便于一刀裁开)",
+    )
+    parser.add_argument(
+        "--gutter",
+        type=float,
+        nargs="?",
+        const=6.0,
+        default=None,
+        help="留缝版: 相邻标签空隙宽度 (pt), 默认 6; 与 --compact 互斥",
+    )
     args = parser.parse_args()
+
+    if args.compact and args.gutter is not None:
+        parser.error("--compact 与 --gutter 不能同时使用")
 
     reader = PdfReader(str(args.input))
     default_count = len(reader.pages) - (args.start - 1) if len(reader.pages) > 1 else args.count
@@ -698,6 +1065,9 @@ def main() -> None:
         src_bbox_override=src_bbox_override,
         max_scale=max_scale,
         cell_padding=args.cell_padding,
+        trim_border=args.trim_border,
+        compact=args.compact,
+        gutter=args.gutter,
     )
 
 
