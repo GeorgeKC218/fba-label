@@ -2,8 +2,9 @@
 FBA 工具站 — 网页版
 
 功能:
-  1. 条码 A4 排版 (按页码拆批, 每页 2/4/6 个)
+  1. 条码 A4 排版 (按页码拆批; 支持无缝/留缝/经典虚线格)
   2. PDF 转曲 (文字转曲线, 避免缺字体打不开)
+  3. PDF 解锁
 
 启动:
     streamlit run app.py
@@ -23,6 +24,31 @@ from make_labels import check_pdf_file
 from pdf_outline import outline_pdf
 from pdf_unlock import is_encrypted, unlock_pdf
 from run_batches import run_batches
+
+
+def pdf_has_outer_frame(path: Path) -> bool:
+    """首页是否有外黑框 (带框标签)。只用 PyMuPDF, 不依赖 make_labels 新符号。"""
+    doc = fitz.open(str(path))
+    try:
+        if doc.page_count < 1:
+            return False
+        page = doc[0]
+        media = page.rect
+        media_area = abs(media)
+        best = None
+        for d in page.get_drawings():
+            if d.get("fill") is not None or d.get("color") is None:
+                continue
+            r = fitz.Rect(d["rect"])
+            if r.is_empty:
+                continue
+            area = abs(r)
+            if 0.35 * media_area < area < 0.98 * media_area:
+                if best is None or area > abs(best):
+                    best = r
+        return best is not None
+    finally:
+        doc.close()
 
 st.set_page_config(
     page_title="FBA 工具站",
@@ -113,27 +139,55 @@ def make_zip(files: list[Path]) -> bytes:
 def page_layout() -> None:
     st.header("条码 A4 排版")
     st.caption(
-        "上传每页 1 个标签的 PDF，按页码拆成多份 A4 排版文件（带虚线格）。"
+        "上传每页 1 个标签的 PDF。"
+        " **带黑框** 的文件请用「无缝贴边」或「留缝裁切」，避免塞进经典虚线格错位。"
     )
 
     with st.sidebar:
         st.subheader("排版选项")
         per_page = st.selectbox(
             "每页标签数",
-            options=[4, 6, 2],
+            options=[4, 6, 9, 2],
             index=0,
             format_func=lambda n: {
                 4: "4 个 (2列×2行)",
                 6: "6 个 (2列×3行)",
+                9: "9 个 (3列×3行)",
                 2: "2 个 (2列×1行)",
             }[n],
+            help="和原来一样可自选；无缝/留缝/经典三种样式都支持这些数量。",
             key="layout_per_page",
         )
-        align = st.selectbox(
-            "格子内对齐", ["center", "top-left"], index=0, key="layout_align"
+        style = st.radio(
+            "排版样式",
+            options=["seamless", "gutter", "classic"],
+            index=0,
+            format_func=lambda k: {
+                "seamless": "无缝贴边（推荐带框）",
+                "gutter": "留缝裁切（中间留白）",
+                "classic": "经典虚线格",
+            }[k],
+            help="带外框的 AWD/FBA 标签请选无缝或留缝；经典格适合已去框或无框文件。与「每页几个」互不影响。",
+            key="layout_style",
         )
-        fill = st.checkbox("放大填满格子", value=False, key="layout_fill")
-        no_grid = st.checkbox("不绘制虚线", value=False, key="layout_nogrid")
+        gutter_pt = 6.0
+        if style == "gutter":
+            gutter_pt = st.slider(
+                "空隙宽度 (pt)",
+                min_value=3.0,
+                max_value=12.0,
+                value=6.0,
+                step=1.0,
+                key="layout_gutter",
+            )
+        align = "center"
+        fill = False
+        if style == "classic":
+            align = st.selectbox(
+                "格子内对齐", ["center", "top-left"], index=0, key="layout_align"
+            )
+            fill = st.checkbox("放大填满格子", value=False, key="layout_fill")
+        no_grid = st.checkbox("不绘制裁切线/虚线", value=False, key="layout_nogrid")
 
     uploaded = st.file_uploader(
         "上传源 PDF（条码）",
@@ -143,10 +197,31 @@ def page_layout() -> None:
     )
 
     if "batch_table" not in st.session_state:
-        st.session_state.batch_table = DEFAULT_BATCHES.copy()
+        st.session_state.batch_table = [dict(r) for r in DEFAULT_BATCHES]
+
+    total_pages: int | None = None
+    if uploaded is not None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / uploaded.name
+            src.write_bytes(uploaded.getvalue())
+            try:
+                check_pdf_file(src)
+                total_pages = pdf_page_count(src)
+                has_frame = pdf_has_outer_frame(src)
+                st.success(f"已识别源文件：**{total_pages}** 页")
+                if has_frame:
+                    st.info(
+                        "检测到标签**外黑框**。请使用侧边栏「无缝贴边」或「留缝裁切」，"
+                        "不要用「经典虚线格」，以免错位。"
+                    )
+                    if style == "classic":
+                        st.warning("当前选的是经典虚线格，带框文件容易错位。")
+            except ValueError as e:
+                st.error(str(e))
+                return
 
     st.subheader("批次设置（页码从 1 开始）")
-    col_add, col_reset, _ = st.columns([1, 1, 4])
+    col_add, col_reset, col_all, _ = st.columns([1, 1.4, 1.2, 2.4])
     with col_add:
         if st.button("＋ 添加一行", key="layout_add"):
             st.session_state.batch_table.append(
@@ -161,7 +236,25 @@ def page_layout() -> None:
             st.rerun()
     with col_reset:
         if st.button("恢复默认 (IT12/30/50)", key="layout_reset"):
-            st.session_state.batch_table = DEFAULT_BATCHES.copy()
+            st.session_state.batch_table = [dict(r) for r in DEFAULT_BATCHES]
+            st.rerun()
+    with col_all:
+        if st.button(
+            "整文件一批",
+            key="layout_all_pages",
+            disabled=total_pages is None,
+            help="把批次改成从第 1 页到最后一页，整本导出一个 PDF",
+        ):
+            stem = Path(uploaded.name).stem if uploaded is not None else "output"
+            st.session_state.batch_table = [
+                {
+                    "启用": True,
+                    "名称": stem,
+                    "起始页": 1,
+                    "结束页": int(total_pages),
+                    "输出文件名": f"{stem}_{per_page}up.pdf",
+                }
+            ]
             st.rerun()
 
     edited = st.data_editor(
@@ -183,19 +276,6 @@ def page_layout() -> None:
     else:
         st.session_state.batch_table = list(edited)
 
-    total_pages: int | None = None
-    if uploaded is not None:
-        with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp) / uploaded.name
-            src.write_bytes(uploaded.getvalue())
-            try:
-                check_pdf_file(src)
-                total_pages = pdf_page_count(src)
-                st.success(f"已识别源文件：**{total_pages}** 页")
-            except ValueError as e:
-                st.error(str(e))
-                return
-
     generate = st.button(
         "生成排版 PDF", type="primary", disabled=uploaded is None, key="layout_go"
     )
@@ -206,6 +286,9 @@ def page_layout() -> None:
         except ValueError as e:
             st.error(str(e))
             return
+
+        compact = style == "seamless"
+        gutter = float(gutter_pt) if style == "gutter" else None
 
         with st.spinner(f"正在生成 {len(batches)} 个文件…"):
             with tempfile.TemporaryDirectory() as tmp:
@@ -224,6 +307,8 @@ def page_layout() -> None:
                         fill=fill,
                         no_grid=no_grid,
                         per_page=per_page,
+                        compact=compact,
+                        gutter=gutter,
                         quiet=True,
                     )
                 except Exception as e:
