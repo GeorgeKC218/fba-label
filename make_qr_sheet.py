@@ -1,15 +1,18 @@
 """
-将「100 二维码 + 底部 4 条码」排成 A4。
+将「N 个二维码 + 1 个外箱条码」排成多页 A4。
 
-源 PDF 结构: 每 101 页一组 = 100 个二维码 + 1 页外箱条码。
-产品编号位数按总数自适应: 4000 → 0001..4000；25200 → 00001..25200。
-箱号: 第 n 页四个条码均为 {n}-{总箱数}，如 001-252 / 01-40。
+源 PDF 结构（循环）: N 页二维码 + 1 页条码。
+输出: 每箱 ceil(N/100) 张 A4；每张最多 10×10=100 个二维码，
+      该箱所有页底部都印同一条码（4 份），避免认错箱。
+
+产品编号位数按总数自适应；箱号为 {箱序}-{总箱数}。
 """
 
 from __future__ import annotations
 
 import argparse
 import io
+import math
 import time
 from pathlib import Path
 
@@ -17,6 +20,7 @@ import fitz
 
 PAGE_W, PAGE_H = 595.44, 841.68
 COLS, ROWS = 10, 10
+QR_PER_PAGE = COLS * ROWS  # 100
 QR_W, QR_H = 44.0, 44.0
 GAP_X, GAP_Y = 10.0, 13.0
 PITCH_X, PITCH_Y = QR_W + GAP_X, QR_H + GAP_Y
@@ -34,9 +38,6 @@ BC_RECTS = [
 QR_CLIP = fitz.Rect(25.44, 5.71, 83.64, 63.90)
 BC_BARS = fitz.Rect(6.0, 6.0, 104.28, 46.32)
 
-GROUP_SIZE = 101  # 100 QR + 1 barcode
-QR_PER_GROUP = 100
-
 _FONT_CANDIDATES = [
     Path(r"C:\Windows\Fonts\simsun.ttc"),
     Path(r"C:\Windows\Fonts\simsun.ttf"),
@@ -47,16 +48,13 @@ _FONT_CANDIDATES = [
 
 
 def resolve_cjk_font() -> tuple[str, Path | None, fitz.Font]:
-    """返回 (fontname, fontfile|None, Font)。云端无宋体时用 PyMuPDF 内置 china-s。"""
     for p in _FONT_CANDIDATES:
         if p.exists():
             return p.stem[:6] or "f0", p, fitz.Font(fontfile=str(p))
-    # Streamlit Cloud / Linux 回退 (PyMuPDF 内置 CJK)
     return "china-s", None, fitz.Font("cjk")
 
 
 def digit_width(n: int) -> int:
-    """按最大值决定补零位数: 4000→4, 252→3, 40→2。"""
     return max(len(str(max(n, 1))), 1)
 
 
@@ -69,33 +67,40 @@ def _classify_page(page) -> str:
     return "BC" if w > h * 1.2 else "QR"
 
 
-def detect_groups(doc: fitz.Document) -> int:
+def detect_groups(doc: fitz.Document, qr_per_box: int) -> int:
+    if qr_per_box < 1:
+        raise ValueError("每箱二维码数量必须 ≥ 1")
+    group_size = qr_per_box + 1
     n = len(doc)
-    if n % GROUP_SIZE != 0:
+    if n % group_size != 0:
         raise ValueError(
-            f"源页数 {n} 不能被 {GROUP_SIZE} 整除，无法按 100码+1条码 分组"
+            f"源页数 {n} 不能被 {group_size}（{qr_per_box}码+1条码）整除，"
+            f"请确认「每箱二维码数」是否填对"
         )
-    groups = n // GROUP_SIZE
+    groups = n // group_size
     for g in (0, groups - 1):
-        base = g * GROUP_SIZE
-        for i in range(QR_PER_GROUP):
+        base = g * group_size
+        for i in range(qr_per_box):
             if _classify_page(doc[base + i]) != "QR":
                 raise ValueError(f"组 {g + 1} 第 {i + 1} 页不是二维码")
-        if _classify_page(doc[base + QR_PER_GROUP]) != "BC":
-            raise ValueError(f"组 {g + 1} 第 101 页不是条码")
+        if _classify_page(doc[base + qr_per_box]) != "BC":
+            raise ValueError(f"组 {g + 1} 第 {qr_per_box + 1} 页不是条码")
     return groups
 
 
-def peek_sheet_info(src: Path) -> dict:
-    """快速查看源文件分组信息（网页预览用）。"""
+def peek_sheet_info(src: Path, qr_per_box: int = 100) -> dict:
     doc = fitz.open(src)
     try:
-        groups = detect_groups(doc)
-        products = groups * QR_PER_GROUP
+        groups = detect_groups(doc, qr_per_box)
+        products = groups * qr_per_box
+        sheets_per_box = math.ceil(qr_per_box / QR_PER_PAGE)
         return {
             "pages": len(doc),
             "groups": groups,
             "products": products,
+            "qr_per_box": qr_per_box,
+            "sheets_per_box": sheets_per_box,
+            "out_pages": groups * sheets_per_box,
             "product_digits": digit_width(products),
             "box_digits": digit_width(groups),
         }
@@ -122,93 +127,113 @@ def insert_label(
     )
 
 
+def _draw_barcodes(
+    page: fitz.Page,
+    src_doc: fitz.Document,
+    bc_page: int,
+    gs1: str,
+    box_label: str,
+    font: fitz.Font,
+    fontname: str,
+) -> None:
+    for dest in BC_RECTS:
+        page.show_pdf_page(dest, src_doc, bc_page, clip=BC_BARS)
+        cx = (dest.x0 + dest.x1) / 2
+        if gs1:
+            insert_label(page, gs1, cx, dest.y1 + 8.0, font, fontname)
+        insert_label(page, box_label, cx, dest.y1 + 16.5, font, fontname)
+
+
 def make_sheet(
     src: Path,
     out: Path | None = None,
     *,
     prefix: str = "406-078",
+    qr_per_box: int = 100,
     start_group: int = 0,
     max_groups: int | None = None,
     label_digits: int | None = None,
     box_digits: int | None = None,
 ) -> Path | bytes:
-    """生成排版 PDF。
-
-    label_digits / box_digits 为 None 时按总数自动决定位数。
-    out 为 None 时返回 PDF bytes；否则写入文件并返回路径。
-    """
     prefix = (prefix or "").strip().rstrip("-")
     if not prefix:
         raise ValueError("编号前缀不能为空")
+    if qr_per_box < 1:
+        raise ValueError("每箱二维码数量必须 ≥ 1")
 
     fontname, fontfile, font = resolve_cjk_font()
+    group_size = qr_per_box + 1
+    sheets_per_box = math.ceil(qr_per_box / QR_PER_PAGE)
 
     src_doc = fitz.open(src)
     try:
-        groups = detect_groups(src_doc)
+        groups = detect_groups(src_doc, qr_per_box)
         if start_group < 0 or start_group >= groups:
             raise ValueError(f"start_group 无效: {start_group}, 共 {groups} 组")
         end_group = (
             groups if max_groups is None else min(groups, start_group + max_groups)
         )
-        total_products = groups * QR_PER_GROUP
+        total_products = groups * qr_per_box
         prod_digits = (
-            label_digits if label_digits and label_digits > 0 else digit_width(total_products)
+            label_digits
+            if label_digits and label_digits > 0
+            else digit_width(total_products)
         )
         box_w = box_digits if box_digits and box_digits > 0 else digit_width(groups)
 
         out_doc = fitz.open()
         t0 = time.time()
-        total = end_group - start_group
+        total_boxes = end_group - start_group
         print(
-            f"源: {Path(src).name}  共 {groups} 组 / {total_products} 个二维码  "
+            f"源: {Path(src).name}  共 {groups} 箱 / {total_products} 个二维码  "
+            f"每箱={qr_per_box} → 每箱 {sheets_per_box} 张A4  "
             f"前缀={prefix}  产品位数={prod_digits}  箱号位数={box_w}"
         )
-        print(f"生成组 {start_group + 1} .. {end_group}  (共 {total} 页 A4)")
 
         for gi, g in enumerate(range(start_group, end_group)):
-            base = g * GROUP_SIZE
-            page = out_doc.new_page(width=PAGE_W, height=PAGE_H)
-            if fontfile is not None:
-                page.insert_font(fontname=fontname, fontfile=str(fontfile))
-
-            for i in range(QR_PER_GROUP):
-                row, col = divmod(i, COLS)
-                x = QR_X0 + col * PITCH_X
-                y = QR_Y0 + row * PITCH_Y
-                page.show_pdf_page(
-                    fitz.Rect(x, y, x + QR_W, y + QR_H),
-                    src_doc,
-                    base + i,
-                    clip=QR_CLIP,
-                )
-                seq = g * QR_PER_GROUP + i + 1
-                label = f"{prefix}-{seq:0{prod_digits}d}"
-                insert_label(
-                    page, label, x + QR_W / 2, y + QR_H + 7.0, font, fontname
-                )
-
-            bc_page = base + QR_PER_GROUP
+            base = g * group_size
+            bc_page = base + qr_per_box
             raw = (src_doc[bc_page].get_text("text") or "").replace("\xa0", " ").strip()
             gs1 = raw.splitlines()[0].strip() if raw else ""
             if gs1.startswith("(00)") and len(gs1) > 4 and gs1[4] != " ":
                 gs1 = "(00) " + gs1[4:]
-
             box_label = f"{g + 1:0{box_w}d}-{groups:0{box_w}d}"
-            for dest in BC_RECTS:
-                page.show_pdf_page(dest, src_doc, bc_page, clip=BC_BARS)
-                cx = (dest.x0 + dest.x1) / 2
-                if gs1:
-                    insert_label(page, gs1, cx, dest.y1 + 8.0, font, fontname)
-                insert_label(page, box_label, cx, dest.y1 + 16.5, font, fontname)
 
-            if (gi + 1) % 10 == 0 or gi == 0 or gi + 1 == total:
+            # 该箱二维码拆到多张 A4；每张都印同一条码
+            for sheet_i in range(sheets_per_box):
+                page = out_doc.new_page(width=PAGE_W, height=PAGE_H)
+                if fontfile is not None:
+                    page.insert_font(fontname=fontname, fontfile=str(fontfile))
+
+                start_i = sheet_i * QR_PER_PAGE
+                end_i = min(start_i + QR_PER_PAGE, qr_per_box)
+                for local, qi in enumerate(range(start_i, end_i)):
+                    row, col = divmod(local, COLS)
+                    x = QR_X0 + col * PITCH_X
+                    y = QR_Y0 + row * PITCH_Y
+                    page.show_pdf_page(
+                        fitz.Rect(x, y, x + QR_W, y + QR_H),
+                        src_doc,
+                        base + qi,
+                        clip=QR_CLIP,
+                    )
+                    seq = g * qr_per_box + qi + 1
+                    label = f"{prefix}-{seq:0{prod_digits}d}"
+                    insert_label(
+                        page, label, x + QR_W / 2, y + QR_H + 7.0, font, fontname
+                    )
+
+                _draw_barcodes(
+                    page, src_doc, bc_page, gs1, box_label, font, fontname
+                )
+
+            if (gi + 1) % 10 == 0 or gi == 0 or gi + 1 == total_boxes:
                 elapsed = time.time() - t0
                 rate = (gi + 1) / elapsed if elapsed > 0 else 0
-                eta = (total - gi - 1) / rate if rate > 0 else 0
+                eta = (total_boxes - gi - 1) / rate if rate > 0 else 0
                 print(
-                    f"  [{gi + 1}/{total}] 组{g + 1} "
-                    f"产品 {g * QR_PER_GROUP + 1}-{(g + 1) * QR_PER_GROUP}  "
+                    f"  [{gi + 1}/{total_boxes}] 箱{g + 1} "
+                    f"产品 {g * qr_per_box + 1}-{(g + 1) * qr_per_box}  "
                     f"{elapsed:.0f}s elapsed, ETA {eta:.0f}s"
                 )
 
@@ -249,29 +274,26 @@ def make_sheet(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="100二维码+4条码 A4 批量排版")
-    ap.add_argument("input", type=Path, help="源 PDF (100码+1条码循环)")
-    ap.add_argument("-o", "--output", type=Path, default=None, help="输出 PDF")
+    ap = argparse.ArgumentParser(description="N二维码+1条码 → 多页A4 拼版")
+    ap.add_argument("input", type=Path, help="源 PDF")
+    ap.add_argument("-o", "--output", type=Path, default=None)
+    ap.add_argument("--prefix", type=str, default="406-078")
     ap.add_argument(
-        "--prefix",
-        type=str,
-        default="406-078",
-        help="产品编号前缀, 如 406-078 → 406-078-0001",
-    )
-    ap.add_argument("--start-group", type=int, default=0, help="从第几组开始 (0-based)")
-    ap.add_argument("--max-groups", type=int, default=None, help="最多生成多少组/页")
-    ap.add_argument(
-        "--digits",
+        "--qr-per-box",
         type=int,
-        default=0,
-        help="产品编号位数; 0=按总数自动 (4000→4位)",
+        default=100,
+        help="每箱对应几个二维码 (100 / 360 …)",
     )
+    ap.add_argument("--start-group", type=int, default=0)
+    ap.add_argument("--max-groups", type=int, default=None)
+    ap.add_argument("--digits", type=int, default=0, help="产品编号位数; 0=自动")
     args = ap.parse_args()
     out = args.output or args.input.with_name(f"{args.input.stem}_A4_sheets.pdf")
     make_sheet(
         args.input,
         out,
         prefix=args.prefix,
+        qr_per_box=args.qr_per_box,
         start_group=args.start_group,
         max_groups=args.max_groups,
         label_digits=args.digits or None,

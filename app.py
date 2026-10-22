@@ -406,28 +406,42 @@ def page_outline() -> None:
 def page_qr_sheet() -> None:
     st.header("二维码+条码拼版")
     st.caption(
-        "上传「每 101 页 = 100 个二维码 + 1 个外箱条码」的源 PDF，"
-        "排成每页 A4：上方 10×10 二维码，下方 4 个相同条码。"
+        "源 PDF 按「N 个二维码 + 1 个外箱条码」循环。"
+        "每张 A4 最多放 100 个二维码；一箱超过 100 会拆成多页，"
+        "**该箱每一页底部都印同一条码**（避免认错）。"
     )
     st.info(
         "编号规则：\n"
         "- 二维码：`前缀-序号`，位数按**产品总数**自动补零"
-        "（4000→0001…4000；25200→00001…25200）\n"
-        "- 条码箱号：第 n 页四个都是 `n-总箱数`"
-        "（如 001-252 / 01-40），不再印前缀"
+        "（4000→0001…4000）\n"
+        "- 条码箱号：该箱所有页四个条码均为 `箱序-总箱数`"
+        "（如 001-252），不再印前缀"
     )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        prefix = st.text_input(
+            "产品编号前缀",
+            value="406-078",
+            key="qrsheet_prefix",
+            help="例如 406-078 → 406-078-0001",
+        )
+    with c2:
+        qr_per_box = st.number_input(
+            "每箱几个二维码",
+            min_value=1,
+            max_value=10000,
+            value=100,
+            step=1,
+            key="qrsheet_qr_per_box",
+            help="100=一箱一页；360=一箱约 4 页且每页同条码",
+        )
 
     uploaded = st.file_uploader(
         "上传源 PDF",
         type=["pdf"],
         key="qrsheet_upload",
-        help="标准 %PDF- 文件；不要用 WPS 另存为的 TSD",
-    )
-    prefix = st.text_input(
-        "产品编号前缀",
-        value="406-078",
-        key="qrsheet_prefix",
-        help="例如 406-078 → 二维码印成 406-078-0001",
+        help="标准 %PDF-；页数须能被 (每箱二维码数+1) 整除",
     )
 
     info = None
@@ -437,18 +451,20 @@ def page_qr_sheet() -> None:
             src.write_bytes(uploaded.getvalue())
             try:
                 check_pdf_file(src)
-                info = peek_sheet_info(src)
+                info = peek_sheet_info(src, qr_per_box=int(qr_per_box))
                 st.success(
                     f"已识别：**{info['pages']}** 页 = "
-                    f"**{info['groups']}** 箱 × 100 = "
-                    f"**{info['products']}** 个二维码"
+                    f"**{info['groups']}** 箱 × **{info['qr_per_box']}** 码 = "
+                    f"**{info['products']}** 个二维码 → 输出约 "
+                    f"**{info['out_pages']}** 张 A4"
+                    f"（每箱 {info['sheets_per_box']} 页）"
                 )
                 pfx = prefix.strip().rstrip("-")
                 pd, bd = info["product_digits"], info["box_digits"]
                 st.caption(
-                    f"二维码示例：`{pfx}-{1:0{pd}d}` … `{pfx}-{info['products']:0{pd}d}`"
+                    f"二维码：`{pfx}-{1:0{pd}d}` … `{pfx}-{info['products']:0{pd}d}`"
                     f"（{pd} 位）　"
-                    f"箱号示例：`{1:0{bd}d}-{info['groups']:0{bd}d}` … "
+                    f"箱号：`{1:0{bd}d}-{info['groups']:0{bd}d}` … "
                     f"`{info['groups']:0{bd}d}-{info['groups']:0{bd}d}`"
                     f"（{bd} 位）"
                 )
@@ -476,13 +492,18 @@ def page_qr_sheet() -> None:
                 src.write_bytes(uploaded.getvalue())
                 out = work / f"{Path(uploaded.name).stem}_sheets.pdf"
                 try:
-                    make_sheet(src, out, prefix=prefix.strip())
+                    make_sheet(
+                        src,
+                        out,
+                        prefix=prefix.strip(),
+                        qr_per_box=int(qr_per_box),
+                    )
                 except Exception as e:
                     st.error(f"生成失败: {e}")
                     return
                 data = out.read_bytes()
                 st.success(
-                    f"完成 · **{info['groups'] if info else '?'}** 页 A4 · "
+                    f"完成 · **{info['out_pages'] if info else '?'}** 页 A4 · "
                     f"约 **{len(data) / 1024 / 1024:.1f} MB**"
                 )
                 st.download_button(
