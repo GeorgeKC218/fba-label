@@ -3,8 +3,8 @@ FBA 工具站 — 网页版
 
 功能:
   1. 条码 A4 排版 (按页码拆批; 支持无缝/留缝/经典虚线格)
-  2. PDF 转曲 (文字转曲线, 避免缺字体打不开)
-  3. PDF 解锁
+  2. 二维码+条码拼版 (可配每箱码数; 大文件分段排队生成)
+  3. PDF 转曲 / PDF 解锁
 
 启动:
     streamlit run app.py
@@ -13,6 +13,7 @@ FBA 工具站 — 网页版
 from __future__ import annotations
 
 import io
+import shutil
 import tempfile
 import zipfile
 from pathlib import Path
@@ -21,7 +22,7 @@ import fitz
 import streamlit as st
 
 from make_labels import check_pdf_file
-from make_qr_sheet import make_sheet, peek_sheet_info
+from make_qr_sheet import make_sheet, merge_pdfs, peek_sheet_info
 from pdf_outline import outline_pdf
 from pdf_unlock import is_encrypted, unlock_pdf
 from run_batches import run_batches
@@ -403,12 +404,57 @@ def page_outline() -> None:
                 )
 
 
+def _qrsheet_clear_job() -> None:
+    job = st.session_state.pop("qrsheet_job", None)
+    if not job:
+        return
+    work = job.get("workdir")
+    if work:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _qrsheet_run_batch(job: dict) -> None:
+    """每轮只处理少量箱，避免云端超时；通过 st.rerun 继续。"""
+    src = Path(job["src_path"])
+    work = Path(job["workdir"])
+    parts_dir = work / "parts"
+    parts_dir.mkdir(exist_ok=True)
+
+    start = int(job["next_group"])
+    total = int(job["groups"])
+    batch = int(job["batch_size"])
+    end = min(start + batch, total)
+
+    for g in range(start, end):
+        part = parts_dir / f"box_{g:04d}.pdf"
+        make_sheet(
+            src,
+            part,
+            prefix=job["prefix"],
+            qr_per_box=int(job["qr_per_box"]),
+            start_group=g,
+            max_groups=1,
+            quiet=True,
+        )
+
+    job["next_group"] = end
+    if end >= total:
+        parts = [parts_dir / f"box_{g:04d}.pdf" for g in range(total)]
+        final = work / job["out_name"]
+        merge_pdfs(parts, final)
+        job["status"] = "done"
+        job["final_path"] = str(final)
+    else:
+        job["status"] = "running"
+
+
 def page_qr_sheet() -> None:
     st.header("二维码+条码拼版")
     st.caption(
         "源 PDF 按「N 个二维码 + 1 个外箱条码」循环。"
         "每张 A4 最多放 100 个二维码；一箱超过 100 会拆成多页，"
-        "**该箱每一页底部都印同一条码**（避免认错）。"
+        "**该箱每一页底部都印同一条码**。"
+        "大文件采用**后台分段生成**，完成后再下载，避免网页超时。"
     )
     st.info(
         "编号规则：\n"
@@ -418,6 +464,74 @@ def page_qr_sheet() -> None:
         "（如 001-252），不再印前缀"
     )
 
+    job = st.session_state.get("qrsheet_job")
+
+    # ----- 任务进行中 / 已完成 -----
+    if job and job.get("status") in ("running", "starting"):
+        total = int(job["groups"])
+        done = int(job["next_group"])
+        st.progress(done / total if total else 0.0)
+        st.write(
+            f"排队生成中：**{done}/{total}** 箱"
+            f"（约 {job.get('out_pages', '?')} 页 A4）…"
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("取消任务", key="qrsheet_cancel"):
+                _qrsheet_clear_job()
+                st.rerun()
+        with c2:
+            st.caption("请保持页面打开，会自动继续下一批。")
+
+        try:
+            _qrsheet_run_batch(job)
+            st.session_state.qrsheet_job = job
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+            st.session_state.qrsheet_job = job
+            st.error(f"生成失败: {e}")
+            if st.button("清除任务", key="qrsheet_clear_err"):
+                _qrsheet_clear_job()
+                st.rerun()
+            return
+
+        if job["status"] == "done":
+            st.rerun()
+        else:
+            st.rerun()
+        return
+
+    if job and job.get("status") == "done":
+        final = Path(job["final_path"])
+        st.success(
+            f"已完成：**{job['groups']}** 箱 · 约 **{job.get('out_pages', '?')}** 页 A4"
+        )
+        if final.exists():
+            data = final.read_bytes()
+            st.download_button(
+                "下载拼版 PDF",
+                data=data,
+                file_name=job["out_name"],
+                mime="application/pdf",
+                type="primary",
+                key="qrsheet_dl_done",
+            )
+            st.caption(f"文件约 **{len(data) / 1024 / 1024:.1f} MB**")
+        else:
+            st.error("结果文件已丢失，请重新生成。")
+        if st.button("开始新任务", key="qrsheet_new"):
+            _qrsheet_clear_job()
+            st.rerun()
+        return
+
+    if job and job.get("status") == "error":
+        st.error(f"上一次任务失败: {job.get('error', '')}")
+        if st.button("清除并重试", key="qrsheet_clear_err2"):
+            _qrsheet_clear_job()
+            st.rerun()
+
+    # ----- 新建任务 -----
     c1, c2 = st.columns(2)
     with c1:
         prefix = st.text_input(
@@ -468,6 +582,11 @@ def page_qr_sheet() -> None:
                     f"`{info['groups']:0{bd}d}-{info['groups']:0{bd}d}`"
                     f"（{bd} 位）"
                 )
+                if info["out_pages"] >= 50:
+                    st.warning(
+                        "页数较多，将自动**分段排队生成**（请保持页面打开），"
+                        "全部完成后再点下载。"
+                    )
             except ValueError as e:
                 st.error(str(e))
                 return
@@ -476,7 +595,7 @@ def page_qr_sheet() -> None:
                 return
 
     go = st.button(
-        "生成拼版 PDF",
+        "开始排队生成",
         type="primary",
         disabled=uploaded is None,
         key="qrsheet_go",
@@ -485,35 +604,30 @@ def page_qr_sheet() -> None:
         if not (prefix or "").strip():
             st.error("请填写产品编号前缀")
             return
-        with st.spinner("正在排版，页数多时可能要几分钟…"):
-            with tempfile.TemporaryDirectory() as tmp:
-                work = Path(tmp)
-                src = work / uploaded.name
-                src.write_bytes(uploaded.getvalue())
-                out = work / f"{Path(uploaded.name).stem}_sheets.pdf"
-                try:
-                    make_sheet(
-                        src,
-                        out,
-                        prefix=prefix.strip(),
-                        qr_per_box=int(qr_per_box),
-                    )
-                except Exception as e:
-                    st.error(f"生成失败: {e}")
-                    return
-                data = out.read_bytes()
-                st.success(
-                    f"完成 · **{info['out_pages'] if info else '?'}** 页 A4 · "
-                    f"约 **{len(data) / 1024 / 1024:.1f} MB**"
-                )
-                st.download_button(
-                    "下载拼版 PDF",
-                    data=data,
-                    file_name=f"{Path(uploaded.name).stem}_sheets.pdf",
-                    mime="application/pdf",
-                    type="primary",
-                    key="qrsheet_dl",
-                )
+        if info is None:
+            st.error("请先成功识别源文件")
+            return
+
+        work = Path(tempfile.mkdtemp(prefix="qrsheet_"))
+        src_path = work / uploaded.name
+        src_path.write_bytes(uploaded.getvalue())
+        # 360 码/箱较重，每轮 1 箱；100 码可每轮 3 箱
+        batch = 1 if int(qr_per_box) >= 200 else 3
+        st.session_state.qrsheet_job = {
+            "status": "running",
+            "workdir": str(work),
+            "src_path": str(src_path),
+            "prefix": prefix.strip(),
+            "qr_per_box": int(qr_per_box),
+            "groups": int(info["groups"]),
+            "out_pages": int(info["out_pages"]),
+            "next_group": 0,
+            "batch_size": batch,
+            "out_name": f"{Path(uploaded.name).stem}_sheets.pdf",
+            "final_path": "",
+            "error": "",
+        }
+        st.rerun()
 
 
 def page_unlock() -> None:

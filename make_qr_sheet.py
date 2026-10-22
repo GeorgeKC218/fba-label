@@ -154,6 +154,7 @@ def make_sheet(
     max_groups: int | None = None,
     label_digits: int | None = None,
     box_digits: int | None = None,
+    quiet: bool = False,
 ) -> Path | bytes:
     prefix = (prefix or "").strip().rstrip("-")
     if not prefix:
@@ -164,6 +165,10 @@ def make_sheet(
     fontname, fontfile, font = resolve_cjk_font()
     group_size = qr_per_box + 1
     sheets_per_box = math.ceil(qr_per_box / QR_PER_PAGE)
+
+    def log(msg: str) -> None:
+        if not quiet:
+            print(msg)
 
     src_doc = fitz.open(src)
     try:
@@ -184,7 +189,7 @@ def make_sheet(
         out_doc = fitz.open()
         t0 = time.time()
         total_boxes = end_group - start_group
-        print(
+        log(
             f"源: {Path(src).name}  共 {groups} 箱 / {total_products} 个二维码  "
             f"每箱={qr_per_box} → 每箱 {sheets_per_box} 张A4  "
             f"前缀={prefix}  产品位数={prod_digits}  箱号位数={box_w}"
@@ -231,7 +236,7 @@ def make_sheet(
                 elapsed = time.time() - t0
                 rate = (gi + 1) / elapsed if elapsed > 0 else 0
                 eta = (total_boxes - gi - 1) / rate if rate > 0 else 0
-                print(
+                log(
                     f"  [{gi + 1}/{total_boxes}] 箱{g + 1} "
                     f"产品 {g * qr_per_box + 1}-{(g + 1) * qr_per_box}  "
                     f"{elapsed:.0f}s elapsed, ETA {eta:.0f}s"
@@ -241,7 +246,7 @@ def make_sheet(
             buf = io.BytesIO()
             out_doc.save(buf, deflate=True, garbage=3)
             out_doc.close()
-            print(f"完成(内存) {time.time() - t0:.0f}s")
+            log(f"完成(内存) {time.time() - t0:.0f}s")
             return buf.getvalue()
 
         out = Path(out)
@@ -252,7 +257,7 @@ def make_sheet(
                 tmp.unlink()
             except OSError:
                 tmp = out.with_name(out.stem + f"_{int(time.time())}.pdf.tmp")
-        print(f"写入 {tmp} …")
+        log(f"写入 {tmp} …")
         out_doc.save(tmp, deflate=True, garbage=3)
         out_doc.close()
         final = out
@@ -263,14 +268,37 @@ def make_sheet(
         except OSError:
             final = out.with_name(f"{out.stem}_{int(time.time())}{out.suffix}")
             tmp.rename(final)
-            print(f"原路径被占用，已另存为: {final.name}")
-        print(
+            log(f"原路径被占用，已另存为: {final.name}")
+        log(
             f"完成: {final}  ({final.stat().st_size / 1024 / 1024:.1f} MB, "
             f"{time.time() - t0:.0f}s)"
         )
         return final
     finally:
         src_doc.close()
+
+
+def merge_pdfs(parts: list[Path], out: Path) -> Path:
+    """按顺序合并多个 PDF。"""
+    if not parts:
+        raise ValueError("没有可合并的分片")
+    merged = fitz.open()
+    try:
+        for p in parts:
+            with fitz.open(p) as doc:
+                merged.insert_pdf(doc)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(out.suffix + ".tmp")
+        merged.save(tmp, deflate=True, garbage=3)
+    finally:
+        merged.close()
+    if out.exists():
+        try:
+            out.unlink()
+        except OSError:
+            out = out.with_name(f"{out.stem}_{int(time.time())}{out.suffix}")
+    tmp.rename(out)
+    return out
 
 
 def main() -> None:
