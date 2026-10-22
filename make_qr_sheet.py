@@ -67,6 +67,32 @@ def _classify_page(page) -> str:
     return "BC" if w > h * 1.2 else "QR"
 
 
+def detect_qr_per_box(doc: fitz.Document, max_scan: int = 10000) -> int:
+    """扫第一组：连续二维码页直到出现条码页 → 每箱二维码数。
+
+    例：第 361 页是条码 → 返回 360（360 码 + 1 条码）。
+    """
+    n = len(doc)
+    if n < 2:
+        raise ValueError("源 PDF 页数太少，无法识别「二维码+条码」结构")
+    limit = min(n, max_scan)
+    qr_count = 0
+    for i in range(limit):
+        kind = _classify_page(doc[i])
+        if kind == "QR":
+            qr_count += 1
+            continue
+        if kind == "BC":
+            if qr_count < 1:
+                raise ValueError("第 1 页就是条码，无法识别每箱二维码数量")
+            return qr_count
+        raise ValueError(f"第 {i + 1} 页无法识别为二维码或条码")
+    raise ValueError(
+        f"前 {limit} 页未找到条码页，请手动填写「每箱二维码数」"
+        "（或确认源文件是「N 个二维码 + 1 个条码」循环）"
+    )
+
+
 def detect_groups(doc: fitz.Document, qr_per_box: int) -> int:
     if qr_per_box < 1:
         raise ValueError("每箱二维码数量必须 ≥ 1")
@@ -78,9 +104,12 @@ def detect_groups(doc: fitz.Document, qr_per_box: int) -> int:
             f"请确认「每箱二维码数」是否填对"
         )
     groups = n // group_size
+    # 只抽查首尾组，避免大文件全量扫描过慢
     for g in (0, groups - 1):
         base = g * group_size
-        for i in range(qr_per_box):
+        # 抽查组内首、中、末二维码页 + 条码页
+        sample_idx = {0, qr_per_box // 2, qr_per_box - 1}
+        for i in sample_idx:
             if _classify_page(doc[base + i]) != "QR":
                 raise ValueError(f"组 {g + 1} 第 {i + 1} 页不是二维码")
         if _classify_page(doc[base + qr_per_box]) != "BC":
@@ -88,9 +117,13 @@ def detect_groups(doc: fitz.Document, qr_per_box: int) -> int:
     return groups
 
 
-def peek_sheet_info(src: Path, qr_per_box: int = 100) -> dict:
+def peek_sheet_info(src: Path, qr_per_box: int | None = None) -> dict:
+    """qr_per_box=None 时自动识别（扫到第一条码页）。"""
     doc = fitz.open(src)
     try:
+        auto = qr_per_box is None or qr_per_box <= 0
+        if auto:
+            qr_per_box = detect_qr_per_box(doc)
         groups = detect_groups(doc, qr_per_box)
         products = groups * qr_per_box
         sheets_per_box = math.ceil(qr_per_box / QR_PER_PAGE)
@@ -103,6 +136,7 @@ def peek_sheet_info(src: Path, qr_per_box: int = 100) -> dict:
             "out_pages": groups * sheets_per_box,
             "product_digits": digit_width(products),
             "box_digits": digit_width(groups),
+            "auto_detected": auto,
         }
     finally:
         doc.close()
@@ -149,7 +183,7 @@ def make_sheet(
     out: Path | None = None,
     *,
     prefix: str = "406-078",
-    qr_per_box: int = 100,
+    qr_per_box: int | None = 100,
     start_group: int = 0,
     max_groups: int | None = None,
     label_digits: int | None = None,
@@ -159,12 +193,8 @@ def make_sheet(
     prefix = (prefix or "").strip().rstrip("-")
     if not prefix:
         raise ValueError("编号前缀不能为空")
-    if qr_per_box < 1:
-        raise ValueError("每箱二维码数量必须 ≥ 1")
 
     fontname, fontfile, font = resolve_cjk_font()
-    group_size = qr_per_box + 1
-    sheets_per_box = math.ceil(qr_per_box / QR_PER_PAGE)
 
     def log(msg: str) -> None:
         if not quiet:
@@ -172,6 +202,13 @@ def make_sheet(
 
     src_doc = fitz.open(src)
     try:
+        if qr_per_box is None or qr_per_box <= 0:
+            qr_per_box = detect_qr_per_box(src_doc)
+            log(f"自动识别：每箱 {qr_per_box} 个二维码（第 {qr_per_box + 1} 页为条码）")
+        if qr_per_box < 1:
+            raise ValueError("每箱二维码数量必须 ≥ 1")
+        group_size = qr_per_box + 1
+        sheets_per_box = math.ceil(qr_per_box / QR_PER_PAGE)
         groups = detect_groups(src_doc, qr_per_box)
         if start_group < 0 or start_group >= groups:
             raise ValueError(f"start_group 无效: {start_group}, 共 {groups} 组")
@@ -309,8 +346,8 @@ def main() -> None:
     ap.add_argument(
         "--qr-per-box",
         type=int,
-        default=100,
-        help="每箱对应几个二维码 (100 / 360 …)",
+        default=0,
+        help="每箱对应几个二维码；0=自动识别（扫到第一条码页）",
     )
     ap.add_argument("--start-group", type=int, default=0)
     ap.add_argument("--max-groups", type=int, default=None)

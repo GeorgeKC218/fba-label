@@ -451,7 +451,8 @@ def _qrsheet_run_batch(job: dict) -> None:
 def page_qr_sheet() -> None:
     st.header("二维码+条码拼版")
     st.caption(
-        "源 PDF 按「N 个二维码 + 1 个外箱条码」循环。"
+        "源 PDF 按「N 个二维码 + 1 个外箱条码」循环；"
+        "默认**自动识别 N**（扫到第一条码页，如第 361 页是条码 → N=360）。"
         "每张 A4 最多放 100 个二维码；一箱超过 100 会拆成多页，"
         "**该箱每一页底部都印同一条码**。"
         "大文件采用**后台分段生成**，完成后再下载，避免网页超时。"
@@ -532,30 +533,35 @@ def page_qr_sheet() -> None:
             st.rerun()
 
     # ----- 新建任务 -----
-    c1, c2 = st.columns(2)
-    with c1:
-        prefix = st.text_input(
-            "产品编号前缀",
-            value="406-078",
-            key="qrsheet_prefix",
-            help="例如 406-078 → 406-078-0001",
-        )
-    with c2:
-        qr_per_box = st.number_input(
-            "每箱几个二维码",
+    prefix = st.text_input(
+        "产品编号前缀",
+        value="406-078",
+        key="qrsheet_prefix",
+        help="例如 406-078 → 406-078-0001；402-378 这类也可",
+    )
+    auto_qr = st.checkbox(
+        "自动识别每箱二维码数（推荐）",
+        value=True,
+        key="qrsheet_auto_qr",
+        help="扫源文件：连续二维码直到出现条码。例：第 361 页是条码 → 每箱 360 码",
+    )
+    qr_manual = 100
+    if not auto_qr:
+        qr_manual = st.number_input(
+            "每箱几个二维码（手动）",
             min_value=1,
             max_value=10000,
             value=100,
             step=1,
             key="qrsheet_qr_per_box",
-            help="100=一箱一页；360=一箱约 4 页且每页同条码",
+            help="仅在关闭自动识别时使用",
         )
 
     uploaded = st.file_uploader(
         "上传源 PDF",
         type=["pdf"],
         key="qrsheet_upload",
-        help="标准 %PDF-；页数须能被 (每箱二维码数+1) 整除",
+        help="标准 %PDF-；结构为「N 个二维码 + 1 个条码」循环",
     )
 
     info = None
@@ -565,9 +571,15 @@ def page_qr_sheet() -> None:
             src.write_bytes(uploaded.getvalue())
             try:
                 check_pdf_file(src)
-                info = peek_sheet_info(src, qr_per_box=int(qr_per_box))
+                info = peek_sheet_info(
+                    src,
+                    qr_per_box=None if auto_qr else int(qr_manual),
+                )
+                how = "自动识别" if info.get("auto_detected") else "手动"
                 st.success(
-                    f"已识别：**{info['pages']}** 页 = "
+                    f"{how}：**每箱 {info['qr_per_box']}** 个二维码"
+                    f"（第 {info['qr_per_box'] + 1} 页为条码）· "
+                    f"**{info['pages']}** 页 = "
                     f"**{info['groups']}** 箱 × **{info['qr_per_box']}** 码 = "
                     f"**{info['products']}** 个二维码 → 输出约 "
                     f"**{info['out_pages']}** 张 A4"
@@ -611,14 +623,15 @@ def page_qr_sheet() -> None:
         work = Path(tempfile.mkdtemp(prefix="qrsheet_"))
         src_path = work / uploaded.name
         src_path.write_bytes(uploaded.getvalue())
+        qpb = int(info["qr_per_box"])
         # 360 码/箱较重，每轮 1 箱；100 码可每轮 3 箱
-        batch = 1 if int(qr_per_box) >= 200 else 3
+        batch = 1 if qpb >= 200 else 3
         st.session_state.qrsheet_job = {
             "status": "running",
             "workdir": str(work),
             "src_path": str(src_path),
             "prefix": prefix.strip(),
-            "qr_per_box": int(qr_per_box),
+            "qr_per_box": qpb,
             "groups": int(info["groups"]),
             "out_pages": int(info["out_pages"]),
             "next_group": 0,
