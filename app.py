@@ -21,6 +21,7 @@ import fitz
 import streamlit as st
 
 from make_labels import check_pdf_file
+from make_qr_sheet import make_sheet, peek_sheet_info
 from pdf_outline import outline_pdf
 from pdf_unlock import is_encrypted, unlock_pdf
 from run_batches import run_batches
@@ -402,6 +403,98 @@ def page_outline() -> None:
                 )
 
 
+def page_qr_sheet() -> None:
+    st.header("二维码+条码拼版")
+    st.caption(
+        "上传「每 101 页 = 100 个二维码 + 1 个外箱条码」的源 PDF，"
+        "排成每页 A4：上方 10×10 二维码，下方 4 个相同条码。"
+    )
+    st.info(
+        "编号规则：\n"
+        "- 二维码：`前缀-序号`，位数按**产品总数**自动补零"
+        "（4000→0001…4000；25200→00001…25200）\n"
+        "- 条码箱号：第 n 页四个都是 `n-总箱数`"
+        "（如 001-252 / 01-40），不再印前缀"
+    )
+
+    uploaded = st.file_uploader(
+        "上传源 PDF",
+        type=["pdf"],
+        key="qrsheet_upload",
+        help="标准 %PDF- 文件；不要用 WPS 另存为的 TSD",
+    )
+    prefix = st.text_input(
+        "产品编号前缀",
+        value="406-078",
+        key="qrsheet_prefix",
+        help="例如 406-078 → 二维码印成 406-078-0001",
+    )
+
+    info = None
+    if uploaded is not None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / uploaded.name
+            src.write_bytes(uploaded.getvalue())
+            try:
+                check_pdf_file(src)
+                info = peek_sheet_info(src)
+                st.success(
+                    f"已识别：**{info['pages']}** 页 = "
+                    f"**{info['groups']}** 箱 × 100 = "
+                    f"**{info['products']}** 个二维码"
+                )
+                pfx = prefix.strip().rstrip("-")
+                pd, bd = info["product_digits"], info["box_digits"]
+                st.caption(
+                    f"二维码示例：`{pfx}-{1:0{pd}d}` … `{pfx}-{info['products']:0{pd}d}`"
+                    f"（{pd} 位）　"
+                    f"箱号示例：`{1:0{bd}d}-{info['groups']:0{bd}d}` … "
+                    f"`{info['groups']:0{bd}d}-{info['groups']:0{bd}d}`"
+                    f"（{bd} 位）"
+                )
+            except ValueError as e:
+                st.error(str(e))
+                return
+            except Exception as e:
+                st.error(f"读取失败: {e}")
+                return
+
+    go = st.button(
+        "生成拼版 PDF",
+        type="primary",
+        disabled=uploaded is None,
+        key="qrsheet_go",
+    )
+    if go and uploaded is not None:
+        if not (prefix or "").strip():
+            st.error("请填写产品编号前缀")
+            return
+        with st.spinner("正在排版，页数多时可能要几分钟…"):
+            with tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                src = work / uploaded.name
+                src.write_bytes(uploaded.getvalue())
+                out = work / f"{Path(uploaded.name).stem}_sheets.pdf"
+                try:
+                    make_sheet(src, out, prefix=prefix.strip())
+                except Exception as e:
+                    st.error(f"生成失败: {e}")
+                    return
+                data = out.read_bytes()
+                st.success(
+                    f"完成 · **{info['groups'] if info else '?'}** 页 A4 · "
+                    f"约 **{len(data) / 1024 / 1024:.1f} MB**"
+                )
+                st.download_button(
+                    "下载拼版 PDF",
+                    data=data,
+                    file_name=f"{Path(uploaded.name).stem}_sheets.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                    key="qrsheet_dl",
+                )
+
+
 def page_unlock() -> None:
     st.header("PDF 解锁")
     st.caption(
@@ -495,14 +588,21 @@ def page_unlock() -> None:
 
 def main() -> None:
     st.title("FBA 工具站")
-    tab1, tab2, tab3 = st.tabs(
-        ["📦 条码 A4 排版", "✏️ PDF 转曲", "🔓 PDF 解锁"]
+    tab1, tab2, tab3, tab4 = st.tabs(
+        [
+            "📦 条码 A4 排版",
+            "🧩 二维码+条码拼版",
+            "✏️ PDF 转曲",
+            "🔓 PDF 解锁",
+        ]
     )
     with tab1:
         page_layout()
     with tab2:
-        page_outline()
+        page_qr_sheet()
     with tab3:
+        page_outline()
+    with tab4:
         page_unlock()
 
     with st.sidebar:
