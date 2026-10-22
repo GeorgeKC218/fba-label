@@ -434,6 +434,11 @@ def _qrsheet_run_batch(job: dict) -> None:
             qr_per_box=int(job["qr_per_box"]),
             start_group=g,
             max_groups=1,
+            product_start=int(job.get("product_start", 1)),
+            box_start=int(job.get("box_start", 1)),
+            box_total=job.get("box_total") or None,
+            grand_total=job.get("grand_total") or None,
+            label_digits=job.get("label_digits") or None,
             quiet=True,
         )
 
@@ -459,10 +464,10 @@ def page_qr_sheet() -> None:
     )
     st.info(
         "编号规则：\n"
-        "- 二维码：`前缀-序号`，位数按**产品总数**自动补零"
-        "（4000→0001…4000）\n"
-        "- 条码箱号：该箱所有页四个条码均为 `箱序-总箱数`"
-        "（如 001-252），不再印前缀"
+        "- 二维码：`前缀-序号`；多文件用「产品起始编号」续编"
+        "（第2份填上一份末号+1）\n"
+        "- 整单总数（如 176400）决定补零位数（6位）\n"
+        "- 箱号：`箱序-总箱数`；多文件同样可设起始箱号与总箱数"
     )
 
     job = st.session_state.get("qrsheet_job")
@@ -557,6 +562,45 @@ def page_qr_sheet() -> None:
             help="仅在关闭自动识别时使用",
         )
 
+    with st.expander("多文件续编（第2份及以后）", expanded=False):
+        st.caption(
+            "第1份：产品起始=1，箱号起始=1。"
+            "第2份：产品起始=上一份末号+1（如 30241），箱号起始=上一份末箱+1。"
+        )
+        c_a, c_b = st.columns(2)
+        with c_a:
+            product_start = st.number_input(
+                "产品起始编号",
+                min_value=1,
+                value=1,
+                step=1,
+                key="qrsheet_product_start",
+            )
+            grand_total = st.number_input(
+                "整单产品总数（补零用，0=按本文件）",
+                min_value=0,
+                value=0,
+                step=1,
+                key="qrsheet_grand_total",
+                help="176400 → 编号 000001…176400（6位）",
+            )
+        with c_b:
+            box_start = st.number_input(
+                "箱号起始",
+                min_value=1,
+                value=1,
+                step=1,
+                key="qrsheet_box_start",
+            )
+            box_total = st.number_input(
+                "整单总箱数（分母，0=按本文件）",
+                min_value=0,
+                value=0,
+                step=1,
+                key="qrsheet_box_total",
+                help="如 490 箱 → 箱号 085-490",
+            )
+
     uploaded = st.file_uploader(
         "上传源 PDF",
         type=["pdf"],
@@ -586,13 +630,24 @@ def page_qr_sheet() -> None:
                     f"（每箱 {info['sheets_per_box']} 页）"
                 )
                 pfx = prefix.strip().rstrip("-")
-                pd, bd = info["product_digits"], info["box_digits"]
+                ps = int(product_start)
+                pe = ps + int(info["products"]) - 1
+                bs = int(box_start)
+                be = bs + int(info["groups"]) - 1
+                denom = int(box_total) if int(box_total) > 0 else be
+                if int(grand_total) > 0:
+                    pd = max(len(str(int(grand_total))), len(str(pe)))
+                else:
+                    pd = len(str(pe))
+                bd = len(str(max(denom, be)))
                 st.caption(
-                    f"二维码：`{pfx}-{1:0{pd}d}` … `{pfx}-{info['products']:0{pd}d}`"
+                    f"本份二维码：`{pfx}-{ps:0{pd}d}` … `{pfx}-{pe:0{pd}d}`"
                     f"（{pd} 位）　"
-                    f"箱号：`{1:0{bd}d}-{info['groups']:0{bd}d}` … "
-                    f"`{info['groups']:0{bd}d}-{info['groups']:0{bd}d}`"
-                    f"（{bd} 位）"
+                    f"箱号：`{bs:0{bd}d}-{denom:0{bd}d}` … "
+                    f"`{be:0{bd}d}-{denom:0{bd}d}`"
+                )
+                st.caption(
+                    f"下一份请填：产品起始 **{pe + 1}**，箱号起始 **{be + 1}**"
                 )
                 if info["out_pages"] >= 50:
                     st.warning(
@@ -626,6 +681,8 @@ def page_qr_sheet() -> None:
         qpb = int(info["qr_per_box"])
         # 360 码/箱较重，每轮 1 箱；100 码可每轮 3 箱
         batch = 1 if qpb >= 200 else 3
+        gt = int(grand_total) or None
+        bt = int(box_total) or None
         st.session_state.qrsheet_job = {
             "status": "running",
             "workdir": str(work),
@@ -636,6 +693,11 @@ def page_qr_sheet() -> None:
             "out_pages": int(info["out_pages"]),
             "next_group": 0,
             "batch_size": batch,
+            "product_start": int(product_start),
+            "box_start": int(box_start),
+            "grand_total": gt,
+            "box_total": bt,
+            "label_digits": None,
             "out_name": f"{Path(uploaded.name).stem}_sheets.pdf",
             "final_path": "",
             "error": "",

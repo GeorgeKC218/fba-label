@@ -188,11 +188,20 @@ def make_sheet(
     max_groups: int | None = None,
     label_digits: int | None = None,
     box_digits: int | None = None,
+    product_start: int = 1,
+    box_start: int = 1,
+    box_total: int | None = None,
+    grand_total: int | None = None,
     quiet: bool = False,
 ) -> Path | bytes:
+    """product_start/box_start 用于多文件续编；grand_total/box_total 决定补零位数与箱号分母。"""
     prefix = (prefix or "").strip().rstrip("-")
     if not prefix:
         raise ValueError("编号前缀不能为空")
+    if product_start < 1:
+        raise ValueError("产品起始编号必须 ≥ 1")
+    if box_start < 1:
+        raise ValueError("箱号起始必须 ≥ 1")
 
     fontname, fontfile, font = resolve_cjk_font()
 
@@ -215,21 +224,32 @@ def make_sheet(
         end_group = (
             groups if max_groups is None else min(groups, start_group + max_groups)
         )
-        total_products = groups * qr_per_box
-        prod_digits = (
-            label_digits
-            if label_digits and label_digits > 0
-            else digit_width(total_products)
+        file_products = groups * qr_per_box
+        # 补零：优先手动位数 → 整单总数 → 本文件末号
+        end_seq = product_start + file_products - 1
+        if label_digits and label_digits > 0:
+            prod_digits = label_digits
+        elif grand_total and grand_total > 0:
+            prod_digits = digit_width(max(grand_total, end_seq))
+        else:
+            prod_digits = digit_width(end_seq)
+        boxes_denom = box_total if box_total and box_total > 0 else (
+            box_start + groups - 1
         )
-        box_w = box_digits if box_digits and box_digits > 0 else digit_width(groups)
+        box_w = (
+            box_digits
+            if box_digits and box_digits > 0
+            else digit_width(max(boxes_denom, box_start + groups - 1))
+        )
 
         out_doc = fitz.open()
         t0 = time.time()
         total_boxes = end_group - start_group
         log(
-            f"源: {Path(src).name}  共 {groups} 箱 / {total_products} 个二维码  "
+            f"源: {Path(src).name}  共 {groups} 箱 / {file_products} 个二维码  "
             f"每箱={qr_per_box} → 每箱 {sheets_per_box} 张A4  "
-            f"前缀={prefix}  产品位数={prod_digits}  箱号位数={box_w}"
+            f"前缀={prefix}  产品={product_start}…{end_seq} ({prod_digits}位)  "
+            f"箱号={box_start}…{box_start + groups - 1}/{boxes_denom}"
         )
 
         for gi, g in enumerate(range(start_group, end_group)):
@@ -239,7 +259,8 @@ def make_sheet(
             gs1 = raw.splitlines()[0].strip() if raw else ""
             if gs1.startswith("(00)") and len(gs1) > 4 and gs1[4] != " ":
                 gs1 = "(00) " + gs1[4:]
-            box_label = f"{g + 1:0{box_w}d}-{groups:0{box_w}d}"
+            box_no = box_start + g
+            box_label = f"{box_no:0{box_w}d}-{boxes_denom:0{box_w}d}"
 
             # 该箱二维码拆到多张 A4；每张都印同一条码
             for sheet_i in range(sheets_per_box):
@@ -259,7 +280,7 @@ def make_sheet(
                         base + qi,
                         clip=QR_CLIP,
                     )
-                    seq = g * qr_per_box + qi + 1
+                    seq = product_start + g * qr_per_box + qi
                     label = f"{prefix}-{seq:0{prod_digits}d}"
                     insert_label(
                         page, label, x + QR_W / 2, y + QR_H + 7.0, font, fontname
@@ -352,6 +373,30 @@ def main() -> None:
     ap.add_argument("--start-group", type=int, default=0)
     ap.add_argument("--max-groups", type=int, default=None)
     ap.add_argument("--digits", type=int, default=0, help="产品编号位数; 0=自动")
+    ap.add_argument(
+        "--product-start",
+        type=int,
+        default=1,
+        help="本文件第一个产品编号（多文件续编：上一份末号+1）",
+    )
+    ap.add_argument(
+        "--grand-total",
+        type=int,
+        default=0,
+        help="整单产品总数（用于补零位数，如 176400→6位）",
+    )
+    ap.add_argument(
+        "--box-start",
+        type=int,
+        default=1,
+        help="本文件第一箱箱号（多文件续编）",
+    )
+    ap.add_argument(
+        "--box-total",
+        type=int,
+        default=0,
+        help="整单总箱数（箱号分母；0=按本文件推算）",
+    )
     args = ap.parse_args()
     out = args.output or args.input.with_name(f"{args.input.stem}_A4_sheets.pdf")
     make_sheet(
@@ -362,6 +407,10 @@ def main() -> None:
         start_group=args.start_group,
         max_groups=args.max_groups,
         label_digits=args.digits or None,
+        product_start=args.product_start,
+        grand_total=args.grand_total or None,
+        box_start=args.box_start,
+        box_total=args.box_total or None,
     )
 
 
