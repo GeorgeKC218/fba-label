@@ -316,7 +316,8 @@ def make_sheet(
             except OSError:
                 tmp = out.with_name(out.stem + f"_{int(time.time())}.pdf.tmp")
         log(f"写入 {tmp} …")
-        out_doc.save(tmp, deflate=True, garbage=3)
+        # garbage=1 比 3 快很多，大文件写盘可省数分钟
+        out_doc.save(tmp, deflate=True, garbage=1)
         out_doc.close()
         final = out
         try:
