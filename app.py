@@ -444,13 +444,21 @@ def _qrsheet_run_batch(job: dict) -> None:
 
     job["next_group"] = end
     if end >= total:
-        parts = [parts_dir / f"box_{g:04d}.pdf" for g in range(total)]
-        final = work / job["out_name"]
-        merge_pdfs(parts, final)
-        job["status"] = "done"
-        job["final_path"] = str(final)
+        # 合并单独一轮，避免「最后一箱+合并」同请求卡死/超时
+        job["status"] = "merging"
     else:
         job["status"] = "running"
+
+
+def _qrsheet_merge(job: dict) -> None:
+    work = Path(job["workdir"])
+    parts_dir = work / "parts"
+    total = int(job["groups"])
+    parts = [parts_dir / f"box_{g:04d}.pdf" for g in range(total)]
+    final = work / job["out_name"]
+    merge_pdfs(parts, final)
+    job["status"] = "done"
+    job["final_path"] = str(final)
 
 
 def page_qr_sheet() -> None:
@@ -472,7 +480,32 @@ def page_qr_sheet() -> None:
 
     job = st.session_state.get("qrsheet_job")
 
-    # ----- 任务进行中 / 已完成 -----
+    # ----- 任务进行中 / 合并中 / 已完成 -----
+    if job and job.get("status") == "merging":
+        st.progress(1.0)
+        st.write(
+            f"各箱已生成完，正在**合并成一个 PDF**"
+            f"（{job.get('groups')} 箱 / 约 {job.get('out_pages', '?')} 页）…"
+            " 请稍等，不要关页面。"
+        )
+        if st.button("取消任务", key="qrsheet_cancel_merge"):
+            _qrsheet_clear_job()
+            st.rerun()
+        try:
+            _qrsheet_merge(job)
+            st.session_state.qrsheet_job = job
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+            st.session_state.qrsheet_job = job
+            st.error(f"合并失败: {e}")
+            if st.button("清除任务", key="qrsheet_clear_merge_err"):
+                _qrsheet_clear_job()
+                st.rerun()
+            return
+        st.rerun()
+        return
+
     if job and job.get("status") in ("running", "starting"):
         total = int(job["groups"])
         done = int(job["next_group"])
@@ -487,7 +520,7 @@ def page_qr_sheet() -> None:
                 _qrsheet_clear_job()
                 st.rerun()
         with c2:
-            st.caption("请保持页面打开，会自动继续下一批。")
+            st.caption("请保持页面打开，会自动继续下一批。最后会多一步「合并」。")
 
         try:
             _qrsheet_run_batch(job)
@@ -502,10 +535,7 @@ def page_qr_sheet() -> None:
                 st.rerun()
             return
 
-        if job["status"] == "done":
-            st.rerun()
-        else:
-            st.rerun()
+        st.rerun()
         return
 
     if job and job.get("status") == "done":

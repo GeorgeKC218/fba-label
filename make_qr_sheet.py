@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import io
 import math
+import shutil
 import time
 from pathlib import Path
 
@@ -37,6 +38,14 @@ BC_RECTS = [
 
 QR_CLIP = fitz.Rect(25.44, 5.71, 83.64, 63.90)
 BC_BARS = fitz.Rect(6.0, 6.0, 104.28, 46.32)
+
+# 工厂对刀线（四角 L，来自对角线模板；在页边空白，不改动二维码/条码坐标）
+CROP_ARM = 19.84
+CROP_W = 1.42
+CROP_TL = (24.89, 32.80)
+CROP_TR = (570.55, 32.80)
+CROP_BL = (24.89, 737.36)
+CROP_BR = (570.55, 737.36)
 
 _FONT_CANDIDATES = [
     Path(r"C:\Windows\Fonts\simsun.ttc"),
@@ -178,6 +187,28 @@ def _draw_barcodes(
         insert_label(page, box_label, cx, dest.y1 + 16.5, font, fontname)
 
 
+def _draw_crop_marks(page: fitz.Page) -> None:
+    """四角 L 形对刀线（页边空白，不压二维码/条码）。"""
+    color = (0, 0, 0)
+    a = CROP_ARM
+
+    def L(cx: float, cy: float, right: bool, down: bool) -> None:
+        hx = cx + a if right else cx - a
+        vy = cy + a if down else cy - a
+        page.draw_line(fitz.Point(cx, cy), fitz.Point(hx, cy), color=color, width=CROP_W)
+        page.draw_line(fitz.Point(cx, cy), fitz.Point(cx, vy), color=color, width=CROP_W)
+
+    tlx, tly = CROP_TL
+    trx, try_ = CROP_TR
+    blx, bly = CROP_BL
+    brx, bry = CROP_BR
+    # 与模板一致：角点在外侧，短线伸向版心
+    L(tlx, tly, right=True, down=True)
+    L(trx, try_, right=False, down=True)
+    L(blx, bly, right=True, down=False)
+    L(brx, bry, right=False, down=False)
+
+
 def make_sheet(
     src: Path,
     out: Path | None = None,
@@ -192,6 +223,7 @@ def make_sheet(
     box_start: int = 1,
     box_total: int | None = None,
     grand_total: int | None = None,
+    crop_marks: bool = True,
     quiet: bool = False,
 ) -> Path | bytes:
     """product_start/box_start 用于多文件续编；grand_total/box_total 决定补零位数与箱号分母。"""
@@ -289,6 +321,8 @@ def make_sheet(
                 _draw_barcodes(
                     page, src_doc, bc_page, gs1, box_label, font, fontname
                 )
+                if crop_marks:
+                    _draw_crop_marks(page)
 
             if (gi + 1) % 10 == 0 or gi == 0 or gi + 1 == total_boxes:
                 elapsed = time.time() - t0
@@ -337,27 +371,44 @@ def make_sheet(
         src_doc.close()
 
 
-def merge_pdfs(parts: list[Path], out: Path) -> Path:
-    """按顺序合并多个 PDF。"""
+def merge_pdfs(parts: list[Path], out: Path, chunk: int = 40) -> Path:
+    """按顺序合并多个 PDF。分片过多时先合并成中间文件，降低内存峰值。"""
     if not parts:
         raise ValueError("没有可合并的分片")
-    merged = fitz.open()
-    try:
-        for p in parts:
-            with fitz.open(p) as doc:
-                merged.insert_pdf(doc)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        tmp = out.with_suffix(out.suffix + ".tmp")
-        merged.save(tmp, deflate=True, garbage=3)
-    finally:
-        merged.close()
-    if out.exists():
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    def _merge_list(files: list[Path], dest: Path) -> Path:
+        merged = fitz.open()
         try:
-            out.unlink()
-        except OSError:
-            out = out.with_name(f"{out.stem}_{int(time.time())}{out.suffix}")
-    tmp.rename(out)
-    return out
+            for p in files:
+                with fitz.open(p) as doc:
+                    merged.insert_pdf(doc)
+            tmp = dest.with_suffix(dest.suffix + ".tmp")
+            merged.save(tmp, deflate=True, garbage=1)
+        finally:
+            merged.close()
+        if dest.exists():
+            try:
+                dest.unlink()
+            except OSError:
+                dest = dest.with_name(f"{dest.stem}_{int(time.time())}{dest.suffix}")
+        tmp.rename(dest)
+        return dest
+
+    if len(parts) <= chunk:
+        return _merge_list(parts, out)
+
+    mid_dir = out.parent / f"_merge_{out.stem}"
+    mid_dir.mkdir(exist_ok=True)
+    mids: list[Path] = []
+    try:
+        for i in range(0, len(parts), chunk):
+            batch = parts[i : i + chunk]
+            mid = mid_dir / f"mid_{i // chunk:04d}.pdf"
+            mids.append(_merge_list(batch, mid))
+        return _merge_list(mids, out)
+    finally:
+        shutil.rmtree(mid_dir, ignore_errors=True)
 
 
 def main() -> None:
