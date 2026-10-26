@@ -44,24 +44,51 @@ def unlock_pdf(
     if not header.startswith(b"%PDF-"):
         raise ValueError(f"{src.name} 不是有效 PDF (文件头: {header!r})")
 
+    raw_pw = "" if password is None else str(password)
+    pw = raw_pw.strip()  # 粘贴时常见首尾空格
+
     doc = fitz.open(str(src))
     try:
         if doc.is_encrypted:
-            # authenticate: True=成功, False=失败
-            ok = doc.authenticate(password)
+            # PyMuPDF: 返回权限位整数，0=失败；旧版也可能是 bool
+            ok = doc.authenticate(pw)
+            if not ok and raw_pw and raw_pw != pw:
+                ok = doc.authenticate(raw_pw)
+            if not ok and pw:
+                ok = doc.authenticate("")  # 少数文件空用户密码即可
             if not ok:
-                raise ValueError("密码错误, 或无法解密此文件")
+                raise ValueError(
+                    "密码错误，或无法解密此文件。"
+                    "请确认是「打开密码」而非仅打印限制；"
+                    "也可留空再试一次。"
+                )
 
         dst.parent.mkdir(parents=True, exist_ok=True)
-        # encryption=fitz.PDF_ENCRYPT_NONE 写出无加密 PDF
-        doc.save(
-            str(dst),
-            encryption=fitz.PDF_ENCRYPT_NONE,
-            deflate=True,
-            garbage=3,
-        )
+        try:
+            doc.save(
+                str(dst),
+                encryption=fitz.PDF_ENCRYPT_NONE,
+                deflate=True,
+                garbage=3,
+                clean=True,
+            )
+        except Exception:
+            doc.save(
+                str(dst),
+                encryption=fitz.PDF_ENCRYPT_NONE,
+                deflate=True,
+                garbage=1,
+            )
     finally:
         doc.close()
+
+    # 校验输出确实可打开且未加密
+    check = fitz.open(str(dst))
+    try:
+        if check.is_encrypted:
+            raise ValueError("写出后仍显示加密，请换用本机 Adobe/WPS 另存或联系技术支持")
+    finally:
+        check.close()
 
     return dst
 

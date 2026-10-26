@@ -741,9 +741,9 @@ def page_unlock() -> None:
         "客户发来的加密 PDF：输入打开密码后，导出一份**无密码**的副本，方便本机打开和继续排版。"
     )
     st.info(
-        "需要客户提供的正确密码才能解锁。"
-        "本工具不会破解未知密码。"
+        "需要客户提供的正确**打开密码**才能解锁（本工具不破解未知密码）。"
         "请上传标准 **%PDF-** 文件。"
+        "解锁成功后下载按钮会保留，刷新前可重复下载。"
     )
 
     uploaded = st.file_uploader(
@@ -759,6 +759,25 @@ def page_unlock() -> None:
         help="若客户说没有密码仍打不开，可先留空试一次",
         placeholder="输入密码（可留空）",
     )
+
+    # 上次解锁结果（避免点下载后页面刷新导致按钮消失）
+    prev = st.session_state.get("unlock_result")
+    if prev and uploaded is not None and prev.get("name") == uploaded.name:
+        st.success(
+            f"已解锁：**{prev['out_name']}** · 约 **{len(prev['data']) / 1024:.0f} KB**"
+            + ("（原文件未加密）" if not prev.get("was_encrypted") else "")
+        )
+        st.download_button(
+            "下载解锁后的 PDF",
+            data=prev["data"],
+            file_name=prev["out_name"],
+            mime="application/pdf",
+            type="primary",
+            key="unlock_dl_prev",
+        )
+        if st.button("清除结果，重新解锁", key="unlock_clear"):
+            st.session_state.pop("unlock_result", None)
+            st.rerun()
 
     enc_hint = None
     if uploaded is not None:
@@ -777,7 +796,7 @@ def page_unlock() -> None:
                 enc = is_encrypted(src)
                 enc_hint = enc
                 if enc:
-                    st.warning(f"**{uploaded.name}** 已加密，请填写密码后解锁。")
+                    st.warning(f"**{uploaded.name}** 已加密，请填写密码后点解锁。")
                 else:
                     st.success(
                         f"**{uploaded.name}** 看起来未加密。"
@@ -788,7 +807,7 @@ def page_unlock() -> None:
                 return
 
     go = st.button(
-        "解锁并下载",
+        "解锁",
         type="primary",
         disabled=uploaded is None,
         key="unlock_go",
@@ -812,18 +831,13 @@ def page_unlock() -> None:
                     return
 
                 data = out.read_bytes()
-                st.success(
-                    f"解锁成功 · 输出约 **{len(data) / 1024:.0f} KB**"
-                    + ("（原文件未加密）" if enc_hint is False else "")
-                )
-                st.download_button(
-                    "下载解锁后的 PDF",
-                    data=data,
-                    file_name=f"{stem}_unlocked.pdf",
-                    mime="application/pdf",
-                    type="primary",
-                    key="unlock_dl",
-                )
+                st.session_state.unlock_result = {
+                    "name": uploaded.name,
+                    "out_name": f"{stem}_unlocked.pdf",
+                    "data": data,
+                    "was_encrypted": bool(enc_hint),
+                }
+        st.rerun()
 
 
 def main() -> None:
